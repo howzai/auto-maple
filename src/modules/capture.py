@@ -32,7 +32,16 @@ try:
 except Exception:
     pass
 
-GAME_WINDOW_TITLE = "MapleStory"
+# Exact titles are checked first. A conservative partial-title fallback is then
+# used for regional clients whose title contains MapleStory / 楓之谷.
+GAME_WINDOW_TITLES = (
+    "MapleStory",
+    "新楓之谷",
+    "新楓之谷：經典版",
+    "新楓之谷:經典版",
+)
+GAME_WINDOW_TITLE_KEYWORDS = ("maplestory", "楓之谷")
+
 TARGET_FPS = 30
 FRAME_INTERVAL = 1.0 / TARGET_FPS
 WINDOW_RETRY_DELAY = 1.0
@@ -70,6 +79,50 @@ def _load_template(relative_path: str) -> np.ndarray:
     return image
 
 
+def _window_title(handle: int) -> str:
+    length = user32.GetWindowTextLengthW(handle)
+    if length <= 0:
+        return ""
+    buffer = ctypes.create_unicode_buffer(length + 1)
+    user32.GetWindowTextW(handle, buffer, len(buffer))
+    return buffer.value.strip()
+
+
+def _find_game_window() -> Tuple[int, str]:
+    """Find a visible MapleStory client window across regional title variants."""
+    for title in GAME_WINDOW_TITLES:
+        handle = user32.FindWindowW(None, title)
+        if handle and user32.IsWindow(handle):
+            return int(handle), title
+
+    matches = []
+    enum_proc_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    @enum_proc_type
+    def enum_proc(handle, _):
+        if not user32.IsWindowVisible(handle):
+            return True
+        title = _window_title(handle)
+        normalized = title.casefold()
+        if title and any(keyword in normalized for keyword in GAME_WINDOW_TITLE_KEYWORDS):
+            matches.append((int(handle), title))
+        return True
+
+    user32.EnumWindows(enum_proc, 0)
+    if not matches:
+        return 0, ""
+
+    # Prefer the largest matching visible window, which avoids launchers or tiny
+    # helper windows that may also contain MapleStory in their title.
+    def area(item):
+        rect = wintypes.RECT()
+        if not user32.GetWindowRect(item[0], ctypes.pointer(rect)):
+            return 0
+        return max(0, rect.right - rect.left) * max(0, rect.bottom - rect.top)
+
+    return max(matches, key=area)
+
+
 MM_TL_TEMPLATE = _load_template("assets/minimap_tl_template.png")
 MM_BR_TEMPLATE = _load_template("assets/minimap_br_template.png")
 PLAYER_TEMPLATE = _load_template("assets/player_template.png")
@@ -95,6 +148,7 @@ class Capture:
         self.minimap_sample: Optional[np.ndarray] = None
         self.sct: Optional[mss.mss] = None
         self.window = {"left": 0, "top": 0, "width": 1366, "height": 768}
+        self.window_title = ""
 
         self.ready = False
         self.calibrated = False
@@ -146,6 +200,7 @@ class Capture:
                 "thread_alive": self.thread.is_alive(),
                 "watchdog_alive": self.watchdog_thread.is_alive(),
                 "window_found": self.window_found,
+                "window_title": self.window_title,
                 "calibrated": self.calibrated,
                 "player_found": self.player_found,
                 "player_confidence": self.player_confidence,
@@ -165,7 +220,7 @@ class Capture:
                 self.sct = sct
                 while not self._stop_event.is_set():
                     if not self._refresh_window():
-                        self._pause_for_safety("Waiting for MapleStory window")
+                        self._pause_for_safety("Waiting for game window")
                         time.sleep(WINDOW_RETRY_DELAY)
                         continue
 
@@ -222,9 +277,10 @@ class Capture:
             self.last_player_seen = 0.0
 
     def _refresh_window(self) -> bool:
-        handle = user32.FindWindowW(None, GAME_WINDOW_TITLE)
+        handle, title = _find_game_window()
         if not handle or not user32.IsWindow(handle) or user32.IsIconic(handle):
             self._handle = 0
+            self.window_title = ""
             self.window_found = False
             self.calibrated = False
             self._reset_tracking()
@@ -240,6 +296,7 @@ class Capture:
         width = rect.right - rect.left
         height = rect.bottom - rect.top
         if width < MMT_WIDTH or height < MMT_HEIGHT:
+            self.last_error = f"Matched game window is too small: {width}x{height}"
             self.window_found = False
             self.calibrated = False
             self._reset_tracking()
@@ -252,13 +309,19 @@ class Capture:
             "height": height,
         }
 
-        if self._handle and (handle != self._handle or new_window != self.window):
+        changed = handle != self._handle or new_window != self.window
+        newly_found = handle != self._handle
+        if self._handle and changed:
             self.calibrated = False
             self._reset_tracking()
 
         self._handle = handle
+        self.window_title = title
         self.window = new_window
         self.window_found = True
+        if newly_found:
+            self.last_error = None
+            print(f"\n[~] Game window found: '{title}' ({width}x{height})")
         return True
 
     @staticmethod
@@ -348,7 +411,6 @@ class Capture:
             relative = utils.convert_to_relative(center, minimap)
             candidates.append((relative, float(result[y, x])))
 
-        # Remove near-duplicate template hits, retaining the strongest result.
         candidates.sort(key=lambda item: item[1], reverse=True)
         deduplicated = []
         for point, score in candidates:
@@ -364,7 +426,6 @@ class Capture:
         if self._filtered_position is None:
             return max(candidates, key=lambda item: item[1])
 
-        # Prefer temporal continuity, with confidence as a small tie-breaker.
         return min(
             candidates,
             key=lambda item: _distance(item[0], self._filtered_position) - item[1] * 0.02,
@@ -388,8 +449,6 @@ class Capture:
             self._filtered_position = filtered
             return filtered
 
-        # A large jump may be a portal/teleport or a false template match. Accept only
-        # after several consecutive frames agree on the new region.
         if self._pending_jump is None or _distance(position, self._pending_jump) > TELEPORT_CLUSTER_RADIUS:
             self._pending_jump = position
             self._pending_jump_frames = 1
@@ -412,7 +471,7 @@ class Capture:
 
     def _capture_and_track(self) -> bool:
         if not self._refresh_window():
-            self._pause_for_safety("MapleStory window lost")
+            self._pause_for_safety("Game window lost")
             return False
 
         frame = self.screenshot(delay=0)
@@ -443,8 +502,6 @@ class Capture:
             self.last_player_seen = now
             self.player_found = True
         elif selected is not None and self._filtered_position is not None:
-            # A potential teleport is still being confirmed. Preserve the last valid
-            # coordinate, but do not claim a fresh successful detection.
             self.player_found = False
         else:
             self.player_found = False
@@ -467,6 +524,7 @@ class Capture:
                 "player_confidence": self.player_confidence,
                 "player_candidates": len(candidates),
                 "window_found": self.window_found,
+                "window_title": self.window_title,
                 "calibrated": self.calibrated,
                 "frame_id": self.frame_id,
                 "rejected_player_jumps": self.rejected_player_jumps,
