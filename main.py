@@ -6,6 +6,7 @@ import time
 from src.common import config
 from src.common.logging_config import configure_logging, get_logger
 from src.common.vkeys import release_all
+from src.modules.background_capture import install_background_capture
 from src.modules.bot import Bot
 from src.modules.capture import Capture
 from src.modules.classic_minimap import install_classic_minimap_fallback
@@ -44,6 +45,9 @@ def main():
     logger.info("Auto Maple startup requested")
 
     # Preserve upstream behavior and install conservative regional fallbacks.
+    # Background capture must be installed before Capture is instantiated so its
+    # FPS state and PrintWindow backend are initialized correctly.
+    install_background_capture(Capture)
     install_classic_minimap_fallback(Capture)
     install_classic_player_fallback(Capture)
 
