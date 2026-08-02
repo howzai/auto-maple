@@ -100,12 +100,38 @@ class Listener(Configurable):
             pass
 
     @staticmethod
+    def _capture_is_usable():
+        capture = getattr(config, 'capture', None)
+        if capture is None:
+            return False, 'capture service is unavailable'
+        if not getattr(capture, 'window_found', False):
+            return False, 'MapleStory window was not found or is minimized'
+        if not getattr(capture, 'calibrated', False):
+            return False, 'minimap is not calibrated'
+        if not getattr(capture, 'player_found', False):
+            return False, 'player marker is not currently visible on the minimap'
+        return True, ''
+
+    @staticmethod
     def toggle_enabled():
         config.bot.rune_active = False
 
         if not config.enabled:
             if not Listener.recalibrate_minimap(timeout=10):
-                print('\n[!] Cannot enable: minimap calibration timed out')
+                error = getattr(config.capture, 'last_error', None)
+                suffix = f': {error}' if error else ''
+                print(f'\n[!] Cannot enable: minimap calibration timed out{suffix}')
+                release_all()
+                return
+
+            # Give the tracker a brief opportunity to find the player after calibration.
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline and not config.capture.player_found:
+                time.sleep(0.02)
+
+            usable, reason = Listener._capture_is_usable()
+            if not usable:
+                print(f'\n[!] Cannot enable: {reason}')
                 release_all()
                 return
 
@@ -114,10 +140,13 @@ class Listener(Configurable):
             release_all()
         utils.print_state()
 
-        if config.enabled:
-            winsound.Beep(784, 333)
-        else:
-            winsound.Beep(523, 333)
+        try:
+            if config.enabled:
+                winsound.Beep(784, 333)
+            else:
+                winsound.Beep(523, 333)
+        except RuntimeError:
+            pass
         time.sleep(0.267)
 
     @staticmethod
@@ -126,16 +155,30 @@ class Listener(Configurable):
             print('\n[!] Cannot reload routine: minimap calibration timed out')
             return
 
+        usable, reason = Listener._capture_is_usable()
+        if not usable:
+            print(f'\n[!] Cannot reload routine: {reason}')
+            return
+
         config.routine.load(config.routine.path)
-        winsound.Beep(523, 200)
-        winsound.Beep(659, 200)
-        winsound.Beep(784, 200)
+        try:
+            winsound.Beep(523, 200)
+            winsound.Beep(659, 200)
+            winsound.Beep(784, 200)
+        except RuntimeError:
+            pass
 
     @staticmethod
     def recalibrate_minimap(timeout=10):
-        config.capture.calibrated = False
+        capture = getattr(config, 'capture', None)
+        if capture is None:
+            return False
+
+        capture.calibrated = False
         deadline = time.monotonic() + timeout
-        while not config.capture.calibrated:
+        while not capture.calibrated:
+            if not capture.thread.is_alive():
+                return False
             if time.monotonic() >= deadline:
                 return False
             time.sleep(0.02)
@@ -146,6 +189,11 @@ class Listener(Configurable):
 
     @staticmethod
     def record_position():
+        capture = getattr(config, 'capture', None)
+        if capture is None or not capture.player_found:
+            print('\n[!] Cannot record position: player marker is not visible')
+            return
+
         pos = tuple('{:.3f}'.format(round(i, 3)) for i in config.player_pos)
         now = datetime.now().strftime('%I:%M:%S %p')
         config.gui.edit.record.add_entry(now, pos)
