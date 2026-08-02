@@ -1,0 +1,9 @@
+# Optional Rune model support for 64-bit Python 3.13 on Windows.
+# Install only after the core environment is working:
+#   python -m pip install -r requirements-ml.txt
+#
+# TensorFlow 2.21 provides a CPython 3.13 Windows x86-64 wheel. Keep this
+# dependency separate because it is large and the legacy Rune model still needs
+# live compatibility validation before the feature can be considered supported.
+
+tensorflow==2.21.0; python_version == "3.13"

@@ -1,64 +1,82 @@
-"""A keyboard listener to track user inputs."""
+"""A keyboard listener to track user inputs and emergency-stop requests."""
 
-import time
 import threading
+import time
 import winsound
-import keyboard as kb
-from src.common.interfaces import Configurable
-from src.common import config, utils
 from datetime import datetime
+
+import keyboard as kb
+
+from src.common import config, utils
+from src.common.interfaces import Configurable
+from src.common.vkeys import release_all
 
 
 class Listener(Configurable):
     DEFAULT_CONFIG = {
         'Start/stop': 'insert',
         'Reload routine': 'f6',
-        'Record position': 'f7'
+        'Record position': 'f7',
+        'Emergency stop': 'f12',
     }
-    BLOCK_DELAY = 1         # Delay after blocking restricted button press
+    BLOCK_DELAY = 1
+    POLL_INTERVAL = 0.02
 
     def __init__(self):
-        """Initializes this Listener object's main thread."""
-
+        """Initialize the listener thread and key edge-detection state."""
         super().__init__('controls')
         config.listener = self
 
         self.enabled = False
         self.ready = False
         self.block_time = 0
-        self.thread = threading.Thread(target=self._main)
-        self.thread.daemon = True
+        self._previously_pressed = set()
+        self.thread = threading.Thread(
+            target=self._main,
+            name='keyboard-listener',
+            daemon=True,
+        )
 
     def start(self):
-        """
-        Starts listening to user inputs.
-        :return:    None
-        """
-
         print('\n[~] Started keyboard listener')
         self.thread.start()
 
-    def _main(self):
-        """
-        Constantly listens for user inputs and updates variables in config accordingly.
-        :return:    None
-        """
+    def _pressed_once(self, key):
+        """Return True only on the transition from released to pressed."""
+        key = str(key).lower()
+        pressed = kb.is_pressed(key)
+        if pressed:
+            if key not in self._previously_pressed:
+                self._previously_pressed.add(key)
+                return True
+        else:
+            self._previously_pressed.discard(key)
+        return False
 
+    def _main(self):
         self.ready = True
         while True:
-            if self.enabled:
-                if kb.is_pressed(self.config['Start/stop']):
-                    Listener.toggle_enabled()
-                elif kb.is_pressed(self.config['Reload routine']):
-                    Listener.reload_routine()
-                elif self.restricted_pressed('Record position'):
-                    Listener.record_position()
-            time.sleep(0.01)
+            try:
+                emergency_key = self.config.get('Emergency stop', 'f12')
+                if self._pressed_once(emergency_key):
+                    self.emergency_stop()
+                elif self.enabled:
+                    if self._pressed_once(self.config['Start/stop']):
+                        Listener.toggle_enabled()
+                    elif self._pressed_once(self.config['Reload routine']):
+                        Listener.reload_routine()
+                    elif self.restricted_pressed('Record position'):
+                        Listener.record_position()
+            except Exception as exc:
+                config.enabled = False
+                release_all()
+                print(f'\n[!] Keyboard listener error: {exc}')
+                time.sleep(0.5)
+            time.sleep(self.POLL_INTERVAL)
 
     def restricted_pressed(self, action):
-        """Returns whether the key bound to ACTION is pressed only if the bot is disabled."""
-
-        if kb.is_pressed(self.config[action]):
+        key = self.config[action]
+        if self._pressed_once(key):
             if not config.enabled:
                 return True
             now = time.time()
@@ -68,42 +86,114 @@ class Listener(Configurable):
         return False
 
     @staticmethod
-    def toggle_enabled():
-        """Resumes or pauses the current routine. Plays a sound to notify the user."""
+    def emergency_stop():
+        """Immediately disable automation and release every held key."""
+        config.enabled = False
+        if getattr(config, 'bot', None) is not None:
+            config.bot.rune_active = False
+        release_all()
+        print('\n[!] EMERGENCY STOP: automation disabled and all keys released')
+        try:
+            winsound.Beep(392, 180)
+            winsound.Beep(262, 300)
+        except RuntimeError:
+            pass
 
+    @staticmethod
+    def _capture_is_usable():
+        capture = getattr(config, 'capture', None)
+        if capture is None:
+            return False, 'capture service is unavailable'
+        if not getattr(capture, 'window_found', False):
+            return False, 'MapleStory window was not found or is minimized'
+        if not getattr(capture, 'calibrated', False):
+            return False, 'minimap is not calibrated'
+        if not getattr(capture, 'player_found', False):
+            return False, 'player marker is not currently visible on the minimap'
+        return True, ''
+
+    @staticmethod
+    def toggle_enabled():
         config.bot.rune_active = False
 
         if not config.enabled:
-            Listener.recalibrate_minimap()      # Recalibrate only when being enabled.
+            if not Listener.recalibrate_minimap(timeout=10):
+                error = getattr(config.capture, 'last_error', None)
+                suffix = f': {error}' if error else ''
+                print(f'\n[!] Cannot enable: minimap calibration timed out{suffix}')
+                release_all()
+                return
+
+            # Give the tracker a brief opportunity to find the player after calibration.
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline and not config.capture.player_found:
+                time.sleep(0.02)
+
+            usable, reason = Listener._capture_is_usable()
+            if not usable:
+                print(f'\n[!] Cannot enable: {reason}')
+                release_all()
+                return
 
         config.enabled = not config.enabled
+        if not config.enabled:
+            release_all()
         utils.print_state()
 
-        if config.enabled:
-            winsound.Beep(784, 333)     # G5
-        else:
-            winsound.Beep(523, 333)     # C5
+        try:
+            if config.enabled:
+                winsound.Beep(784, 333)
+            else:
+                winsound.Beep(523, 333)
+        except RuntimeError:
+            pass
         time.sleep(0.267)
 
     @staticmethod
     def reload_routine():
-        Listener.recalibrate_minimap()
+        if not Listener.recalibrate_minimap(timeout=10):
+            print('\n[!] Cannot reload routine: minimap calibration timed out')
+            return
+
+        usable, reason = Listener._capture_is_usable()
+        if not usable:
+            print(f'\n[!] Cannot reload routine: {reason}')
+            return
 
         config.routine.load(config.routine.path)
-
-        winsound.Beep(523, 200)     # C5
-        winsound.Beep(659, 200)     # E5
-        winsound.Beep(784, 200)     # G5
+        try:
+            winsound.Beep(523, 200)
+            winsound.Beep(659, 200)
+            winsound.Beep(784, 200)
+        except RuntimeError:
+            pass
 
     @staticmethod
-    def recalibrate_minimap():
-        config.capture.calibrated = False
-        while not config.capture.calibrated:
-            time.sleep(0.01)
-        config.gui.edit.minimap.redraw()
+    def recalibrate_minimap(timeout=10):
+        capture = getattr(config, 'capture', None)
+        if capture is None:
+            return False
+
+        capture.calibrated = False
+        deadline = time.monotonic() + timeout
+        while not capture.calibrated:
+            if not capture.thread.is_alive():
+                return False
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.02)
+
+        if getattr(config, 'gui', None) is not None:
+            config.gui.edit.minimap.redraw()
+        return True
 
     @staticmethod
     def record_position():
+        capture = getattr(config, 'capture', None)
+        if capture is None or not capture.player_found:
+            print('\n[!] Cannot record position: player marker is not visible')
+            return
+
         pos = tuple('{:.3f}'.format(round(i, 3)) for i in config.player_pos)
         now = datetime.now().strftime('%I:%M:%S %p')
         config.gui.edit.record.add_entry(now, pos)

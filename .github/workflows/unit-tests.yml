@@ -1,0 +1,20 @@
+name: Unit tests
+
+on:
+  pull_request:
+  push:
+    branches:
+      - feature/optimized-foundation
+
+jobs:
+  snapshots:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Show Python version
+        run: python --version
+      - name: Run dependency-free unit tests
+        run: python -m unittest tests.test_snapshots -v

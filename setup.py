@@ -1,68 +1,99 @@
-"""Creates a desktop shortcut that can run Auto Maple from anywhere."""
+"""Create a desktop shortcut that launches this checkout safely on Windows."""
 
-import os
-import sys
-import ctypes
+from __future__ import annotations
+
 import argparse
+import ctypes
+import os
+import subprocess
+import sys
+from pathlib import Path
+
 import win32com.client as client
 
 
-MAX_DEPTH = 1       # Run at most MAX_DEPTH additional times
+MAX_DEPTH = 1
+PROJECT_ROOT = Path(__file__).resolve().parent
 
 
-def run_as_admin():
-    if args.depth < MAX_DEPTH:
-        print('\n[!] Insufficient privileges, re-running as administrator')
-        ctypes.windll.shell32.ShellExecuteW(
-            None,
-            'runas',
-            sys.executable,
-            ' '.join(sys.argv + [f'--depth {args.depth + 1}']),
-            None,
-            1
-        )
-        print(' ~  Finished setting up Auto Maple')
-    exit(0)
+def quote_cmd(value: str) -> str:
+    """Quote one command-line value for cmd.exe."""
+    return '"' + value.replace('"', '""') + '"'
 
 
-def create_desktop_shortcut():
-    """Creates and saves a desktop shortcut using absolute paths"""
-    print('\n[~] Creating desktop shortcut for Auto Maple:')
-    cwd = os.getcwd()
-    target = os.path.join(os.environ['WINDIR'], 'System32', 'cmd.exe')
+def run_as_admin(args) -> None:
+    if args.depth >= MAX_DEPTH:
+        raise PermissionError("Unable to create or modify the desktop shortcut")
 
-    flag = "/c"
+    print("\n[!] Insufficient privileges; requesting administrator access")
+    forwarded = [str(Path(__file__).resolve()), "--depth", str(args.depth + 1)]
     if args.stay:
-        flag = "/k"
-        print(" -  Leaving command prompt open after program finishes")
+        forwarded.append("--stay")
 
-    shell = client.Dispatch('WScript.Shell')
-    shortcut_path = os.path.join(shell.SpecialFolders('Desktop'), 'Auto Maple.lnk')
-    shortcut = shell.CreateShortCut(shortcut_path)
-    shortcut.Targetpath = target
-    shortcut.Arguments = flag + f' \"cd {cwd} & python main.py\"'
-    shortcut.IconLocation = os.path.join(cwd, 'assets', 'icon.ico')
+    parameters = subprocess.list2cmdline(forwarded)
+    result = ctypes.windll.shell32.ShellExecuteW(
+        None,
+        "runas",
+        sys.executable,
+        parameters,
+        str(PROJECT_ROOT),
+        1,
+    )
+    if result <= 32:
+        raise OSError(f"Administrator launch failed with code {result}")
+
+
+def create_desktop_shortcut(args) -> Path:
+    """Create a shortcut using stable absolute paths and the active Python."""
+    print("\n[~] Creating desktop shortcut for Auto Maple")
+
+    shell = client.Dispatch("WScript.Shell")
+    desktop = Path(shell.SpecialFolders("Desktop"))
+    shortcut_path = desktop / "Auto Maple.lnk"
+    cmd_path = Path(os.environ.get("COMSPEC", Path(os.environ["WINDIR"]) / "System32" / "cmd.exe"))
+
+    flag = "/k" if args.stay else "/c"
+    command = (
+        f"cd /d {quote_cmd(str(PROJECT_ROOT))} && "
+        f"{quote_cmd(sys.executable)} {quote_cmd(str(PROJECT_ROOT / 'main.py'))}"
+    )
+
+    shortcut = shell.CreateShortCut(str(shortcut_path))
+    shortcut.TargetPath = str(cmd_path)
+    shortcut.Arguments = f"{flag} {quote_cmd(command)}"
+    shortcut.WorkingDirectory = str(PROJECT_ROOT)
+    shortcut.IconLocation = str(PROJECT_ROOT / "assets" / "icon.ico")
+    shortcut.Description = "Launch Auto Maple from this checkout"
+
     try:
         shortcut.save()
-    except:
-        run_as_admin()
+    except Exception:
+        run_as_admin(args)
+        return shortcut_path
 
-    # Enable "run as administrator"
-    with open(shortcut_path, 'rb') as lnk:
-        arr = bytearray(lnk.read())
-
-    arr[0x15] = arr[0x15] | 0x20        # Set the 6th bit of 21st byte to 1
-
-    with open(shortcut_path, 'wb') as lnk:
-        lnk.write(arr)
-        print(' -  Enabled the "Run as Administrator" option')
-    print(' ~  Successfully created Auto Maple shortcut')
+    print(f"[~] Shortcut created: {shortcut_path}")
+    if args.stay:
+        print("[~] Command Prompt will remain open after the application exits")
+    return shortcut_path
 
 
-if __name__ == '__main__':
+def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument('--depth', type=int, default=0)
-    parser.add_argument('--stay', action='store_true')
+    parser.add_argument("--depth", type=int, default=0, help=argparse.SUPPRESS)
+    parser.add_argument("--stay", action="store_true", help="Keep the console open after exit")
     args = parser.parse_args()
 
-    create_desktop_shortcut()
+    if os.name != "nt":
+        print("[!] Shortcut setup is supported only on Windows")
+        return 1
+
+    try:
+        create_desktop_shortcut(args)
+    except Exception as exc:
+        print(f"[!] Shortcut setup failed: {exc}")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

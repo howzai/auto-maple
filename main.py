@@ -1,35 +1,89 @@
-"""The central program that ties all the modules together."""
+"""Central application startup with bounded initialization and safe shutdown."""
 
+import sys
 import time
+
+from src.common import config
+from src.common.logging_config import configure_logging, get_logger
+from src.common.vkeys import release_all
+from src.modules.background_capture import install_background_capture
 from src.modules.bot import Bot
 from src.modules.capture import Capture
-from src.modules.notifier import Notifier
-from src.modules.listener import Listener
+from src.modules.classic_minimap import install_classic_minimap_fallback
+from src.modules.classic_player import install_classic_player_fallback
 from src.modules.gui import GUI
+from src.modules.listener import Listener
+from src.modules.notifier import Notifier
 
 
-bot = Bot()
-capture = Capture()
-notifier = Notifier()
-listener = Listener()
+STARTUP_TIMEOUT_SECONDS = 30
+logger = get_logger("main")
 
-bot.start()
-while not bot.ready:
-    time.sleep(0.01)
 
-capture.start()
-while not capture.ready:
-    time.sleep(0.01)
+def _start_and_wait(component, display_name, timeout=STARTUP_TIMEOUT_SECONDS):
+    """Start COMPONENT and wait for readiness without hanging forever."""
+    logger.info("Starting %s", display_name)
+    component.start()
+    deadline = time.monotonic() + timeout
 
-notifier.start()
-while not notifier.ready:
-    time.sleep(0.01)
+    while not component.ready:
+        thread = getattr(component, "thread", None)
+        if thread is not None and not thread.is_alive():
+            raise RuntimeError(f"{display_name} stopped during initialization")
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"{display_name} did not become ready within {timeout} seconds"
+            )
+        time.sleep(0.02)
 
-listener.start()
-while not listener.ready:
-    time.sleep(0.01)
+    logger.info("%s is ready", display_name)
 
-print('\n[~] Successfully initialized Auto Maple')
 
-gui = GUI()
-gui.start()
+def main():
+    """Initialize all modules and start the GUI."""
+    configure_logging()
+    logger.info("Auto Maple startup requested")
+
+    # Preserve upstream behavior and install conservative regional fallbacks.
+    # Background capture must be installed before Capture is instantiated so its
+    # FPS state and PrintWindow backend are initialized correctly.
+    install_background_capture(Capture)
+    install_classic_minimap_fallback(Capture)
+    install_classic_player_fallback(Capture)
+
+    bot = Bot()
+    capture = Capture()
+    notifier = Notifier()
+    listener = Listener()
+
+    _start_and_wait(bot, "Bot")
+    _start_and_wait(capture, "Capture")
+    _start_and_wait(notifier, "Notifier")
+    _start_and_wait(listener, "Listener")
+
+    logger.info("Successfully initialized Auto Maple")
+    print("\n[~] Successfully initialized Auto Maple")
+    print("[~] Press F12 at any time for emergency stop")
+
+    gui = GUI()
+    gui.start()
+
+
+if __name__ == "__main__":
+    exit_code = 0
+    try:
+        main()
+    except KeyboardInterrupt:
+        logger.info("Auto Maple interrupted by user")
+        print("\n[~] Auto Maple interrupted by user")
+    except Exception:
+        config.enabled = False
+        exit_code = 1
+        logger.exception("Auto Maple failed to start")
+        print("\n[!] Auto Maple failed to start; see logs/auto-maple.log")
+    finally:
+        config.enabled = False
+        release_all()
+        logger.info("Auto Maple shutdown complete with exit code %s", exit_code)
+
+    sys.exit(exit_code)
