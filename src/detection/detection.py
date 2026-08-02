@@ -23,15 +23,21 @@ def tensorflow_available() -> bool:
 
 
 def load_model():
-    """Load the optional Rune model, or raise a clear runtime error."""
+    """Load the optional Rune model, returning None when TensorFlow is absent."""
     if tf is None:
-        raise TensorFlowUnavailableError(
-            "TensorFlow is not installed. Core capture and GUI features remain available; "
-            "install requirements-ml.txt to enable Rune model support."
+        print(
+            "\n[~] TensorFlow is not installed; Rune model support is disabled. "
+            "Core capture and GUI features remain available."
         )
+        return None
 
     model_dir = "assets/models/rune_model_rnn_filtered_cannied/saved_model"
-    return tf.saved_model.load(model_dir)
+    try:
+        return tf.saved_model.load(model_dir)
+    except Exception as exc:
+        print(f"\n[!] Rune model could not be loaded: {exc}")
+        print("[~] Continuing with Rune model support disabled")
+        return None
 
 
 def canny(image):
@@ -49,8 +55,8 @@ def filter_color(image):
 
 
 def run_inference_for_single_image(model, image):
-    if tf is None:
-        raise TensorFlowUnavailableError("TensorFlow is unavailable")
+    if tf is None or model is None:
+        raise TensorFlowUnavailableError("TensorFlow Rune detection is unavailable")
 
     image = np.asarray(image)
     input_tensor = tf.convert_to_tensor(image)
