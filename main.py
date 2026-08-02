@@ -9,6 +9,7 @@ from src.common.vkeys import release_all
 from src.modules.bot import Bot
 from src.modules.capture import Capture
 from src.modules.classic_minimap import install_classic_minimap_fallback
+from src.modules.classic_player import install_classic_player_fallback
 from src.modules.gui import GUI
 from src.modules.listener import Listener
 from src.modules.notifier import Notifier
@@ -42,9 +43,9 @@ def main():
     configure_logging()
     logger.info("Auto Maple startup requested")
 
-    # Preserve the upstream template matcher, then add a conservative fallback
-    # for the Traditional Chinese classic client's different minimap frame.
+    # Preserve upstream behavior and install conservative regional fallbacks.
     install_classic_minimap_fallback(Capture)
+    install_classic_player_fallback(Capture)
 
     bot = Bot()
     capture = Capture()
