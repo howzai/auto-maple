@@ -1,9 +1,2 @@
-GitPython
-keyboard
-mss
-numpy
-opencv-python-headless
-Pillow
-pygame
-pywin32
-tensorflow
+# Core runtime dependencies. Optional TensorFlow support is in requirements-ml.txt.
+-r requirements-core.txt
