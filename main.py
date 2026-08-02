@@ -52,15 +52,18 @@ def main():
 
 
 if __name__ == '__main__':
+    exit_code = 0
     try:
         main()
     except KeyboardInterrupt:
         print('\n[~] Auto Maple interrupted by user')
     except Exception as exc:
         config.enabled = False
+        exit_code = 1
         print(f'\n[!] Auto Maple failed to start: {exc}')
         traceback.print_exc()
-        sys.exit_code = 1
     finally:
         config.enabled = False
         release_all()
+
+    sys.exit(exit_code)
