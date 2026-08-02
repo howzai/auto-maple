@@ -1,6 +1,8 @@
-"""Directional-arrow classification with optional TensorFlow support."""
+"""Detection helpers for Rune arrows and classic-client player markers."""
 
 from __future__ import annotations
+
+from typing import List, Tuple
 
 import cv2
 import numpy as np
@@ -13,12 +15,15 @@ except ImportError:
     tf = None
 
 
+Point = Tuple[float, float]
+PlayerCandidate = Tuple[Point, float]
+
+
 class TensorFlowUnavailableError(RuntimeError):
     """Raised when Rune detection is requested without TensorFlow installed."""
 
 
 def tensorflow_available() -> bool:
-    """Return whether the optional TensorFlow runtime is available."""
     return tf is not None
 
 
@@ -38,6 +43,67 @@ def load_model():
         print(f"\n[!] Rune model could not be loaded: {exc}")
         print("[~] Continuing with Rune model support disabled")
         return None
+
+
+def classic_player_candidates(minimap: np.ndarray) -> List[PlayerCandidate]:
+    """Find cyan/blue player markers used by the Traditional Chinese classic UI.
+
+    The function is deliberately bounded: connected components are filtered by
+    size and only the strongest eight candidates are returned. This prevents a
+    noisy minimap from stalling the capture thread.
+    """
+    if minimap is None or minimap.size == 0 or minimap.ndim != 3:
+        return []
+
+    bgr = minimap[:, :, :3]
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+
+    # Classic-client player markers are bright cyan/blue. Two overlapping ranges
+    # tolerate display scaling and compression without accepting red/yellow NPC dots.
+    mask_cyan = cv2.inRange(hsv, (78, 75, 135), (105, 255, 255))
+    mask_blue = cv2.inRange(hsv, (106, 90, 120), (132, 255, 255))
+    mask = cv2.bitwise_or(mask_cyan, mask_blue)
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+    count, _, stats, centroids = cv2.connectedComponentsWithStats(mask, 8)
+    height, width = minimap.shape[:2]
+    candidates: List[PlayerCandidate] = []
+
+    for index in range(1, count):
+        x, y, component_w, component_h, area = stats[index]
+        if not 3 <= area <= 120:
+            continue
+        if not 2 <= component_w <= 18 or not 2 <= component_h <= 18:
+            continue
+
+        aspect = component_w / max(component_h, 1)
+        if not 0.35 <= aspect <= 2.8:
+            continue
+
+        cx, cy = centroids[index]
+        x1, y1 = max(0, x), max(0, y)
+        x2, y2 = min(width, x + component_w), min(height, y + component_h)
+        component_hsv = hsv[y1:y2, x1:x2]
+        component_mask = mask[y1:y2, x1:x2] > 0
+        if component_hsv.size == 0 or not np.any(component_mask):
+            continue
+
+        saturation = float(np.mean(component_hsv[:, :, 1][component_mask])) / 255.0
+        value = float(np.mean(component_hsv[:, :, 2][component_mask])) / 255.0
+        fill = area / float(max(component_w * component_h, 1))
+        size_score = 1.0 - min(1.0, abs(area - 18.0) / 70.0)
+        confidence = min(
+            0.99,
+            0.30 + 0.25 * saturation + 0.20 * value + 0.15 * fill + 0.10 * size_score,
+        )
+        point = (float(cx) / max(width, 1), float(cy) / max(height, 1))
+        candidates.append((point, confidence))
+
+    candidates.sort(key=lambda item: item[1], reverse=True)
+    return candidates[:8]
 
 
 def canny(image):
