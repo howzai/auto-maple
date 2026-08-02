@@ -1,13 +1,8 @@
-"""Occlusion-resistant Windows capture backend and bounded FPS tracking.
+"""Occlusion-resistant client-area capture and bounded FPS tracking.
 
-The upstream capture path uses MSS, which reads desktop pixels and therefore sees
-whatever overlaps the game window.  This module first asks the target window to
-render itself into a memory bitmap with PrintWindow.  If the game or graphics
-stack refuses that request, capture safely falls back to the original MSS path.
-
-PrintWindow support is application-dependent.  It usually handles ordinary
-window overlap, but protected or GPU-exclusive surfaces may return a black frame,
-and minimized windows are not guaranteed to render.
+Both PrintWindow and MSS are kept in the same client-area coordinate system. This
+avoids calibration drift caused by mixing whole-window coordinates (title bar and
+borders included) with client-only rendered pixels.
 """
 
 from __future__ import annotations
@@ -21,26 +16,51 @@ import cv2
 import numpy as np
 import win32gui
 import win32ui
-from ctypes import wintypes
 
 
 user32 = ctypes.windll.user32
+PW_CLIENTONLY = 0x00000001
 PW_RENDERFULLCONTENT = 0x00000002
 
 
 def _looks_usable(frame: Optional[np.ndarray]) -> bool:
-    """Reject empty, nearly black, or effectively constant PrintWindow frames."""
     if frame is None or frame.size == 0 or frame.ndim != 3:
         return False
-    sample = frame[:: max(1, frame.shape[0] // 120), :: max(1, frame.shape[1] // 160), :3]
+    sample = frame[
+        :: max(1, frame.shape[0] // 120),
+        :: max(1, frame.shape[1] // 160),
+        :3,
+    ]
     if sample.size == 0:
         return False
     gray = cv2.cvtColor(sample, cv2.COLOR_BGR2GRAY)
     return float(gray.mean()) > 2.0 and float(gray.std()) > 2.0
 
 
-def _print_window_bgra(handle: int, width: int, height: int) -> Optional[np.ndarray]:
-    """Render HANDLE into a BGRA NumPy image without reading desktop pixels."""
+def _client_screen_rect(handle: int):
+    """Return client-area bounds in screen coordinates."""
+    if not handle or not user32.IsWindow(handle):
+        return None
+    try:
+        left, top, right, bottom = win32gui.GetClientRect(handle)
+        screen_left, screen_top = win32gui.ClientToScreen(handle, (left, top))
+        screen_right, screen_bottom = win32gui.ClientToScreen(handle, (right, bottom))
+        width = max(0, screen_right - screen_left)
+        height = max(0, screen_bottom - screen_top)
+        if width <= 0 or height <= 0:
+            return None
+        return {
+            "left": int(screen_left),
+            "top": int(screen_top),
+            "width": int(width),
+            "height": int(height),
+        }
+    except Exception:
+        return None
+
+
+def _print_client_bgra(handle: int, width: int, height: int) -> Optional[np.ndarray]:
+    """Render only the target window's client area into a BGRA image."""
     if not handle or width <= 0 or height <= 0:
         return None
 
@@ -49,7 +69,8 @@ def _print_window_bgra(handle: int, width: int, height: int) -> Optional[np.ndar
     memory_dc = None
     bitmap = None
     try:
-        hwnd_dc = user32.GetWindowDC(handle)
+        # GetDC targets the client area; GetWindowDC would include non-client chrome.
+        hwnd_dc = user32.GetDC(handle)
         if not hwnd_dc:
             return None
 
@@ -59,7 +80,8 @@ def _print_window_bgra(handle: int, width: int, height: int) -> Optional[np.ndar
         bitmap.CreateCompatibleBitmap(source_dc, width, height)
         memory_dc.SelectObject(bitmap)
 
-        rendered = user32.PrintWindow(handle, memory_dc.GetSafeHdc(), PW_RENDERFULLCONTENT)
+        flags = PW_CLIENTONLY | PW_RENDERFULLCONTENT
+        rendered = user32.PrintWindow(handle, memory_dc.GetSafeHdc(), flags)
         if not rendered:
             return None
 
@@ -96,11 +118,12 @@ def _print_window_bgra(handle: int, width: int, height: int) -> Optional[np.ndar
 
 
 def install_background_capture(capture_class) -> None:
-    """Patch Capture with PrintWindow-first capture and rolling FPS metrics."""
+    """Patch Capture with aligned client capture and rolling FPS metrics."""
     if getattr(capture_class, "_background_capture_patch_installed", False):
         return
 
     original_init = capture_class.__init__
+    original_refresh_window = capture_class._refresh_window
     original_screenshot = capture_class.screenshot
     original_capture_and_track = capture_class._capture_and_track
 
@@ -111,29 +134,55 @@ def install_background_capture(capture_class) -> None:
         self._frame_times = deque(maxlen=120)
         self._background_failures = 0
         self._background_retry_after = 0.0
+        self._client_rect = None
+
+    def patched_refresh_window(self):
+        previous_rect = dict(getattr(self, "window", {}) or {})
+        ok = original_refresh_window(self)
+        if not ok:
+            self._client_rect = None
+            return False
+
+        client_rect = _client_screen_rect(int(getattr(self, "_handle", 0)))
+        if client_rect is None:
+            return True
+
+        # Use one coordinate space for calibration, tracking, PrintWindow and MSS.
+        changed = client_rect != self._client_rect
+        self._client_rect = dict(client_rect)
+        self.window = dict(client_rect)
+        if changed and previous_rect != client_rect:
+            self.calibrated = False
+            if hasattr(self, "_reset_tracking"):
+                self._reset_tracking()
+        return True
 
     def patched_screenshot(self, delay: float = 1.0):
         now = time.monotonic()
-        width = int(self.window.get("width", 0))
-        height = int(self.window.get("height", 0))
+        rect = self._client_rect or self.window
+        width = int(rect.get("width", 0))
+        height = int(rect.get("height", 0))
 
-        # Avoid repeatedly calling a backend that the client has just rejected.
         if now >= self._background_retry_after:
-            frame = _print_window_bgra(int(getattr(self, "_handle", 0)), width, height)
+            frame = _print_client_bgra(
+                int(getattr(self, "_handle", 0)),
+                width,
+                height,
+            )
             if frame is not None:
-                self.capture_backend = "PrintWindow"
+                self.capture_backend = "PrintWindow client"
                 self._background_failures = 0
                 return frame
 
             self._background_failures += 1
-            # Back off briefly after repeated failures, while preserving MSS capture.
             if self._background_failures >= 3:
                 self._background_retry_after = now + 2.0
                 self._background_failures = 0
 
+        # original_screenshot reads self.window, now also client-area aligned.
         frame = original_screenshot(self, delay=delay)
         if frame is not None:
-            self.capture_backend = "MSS desktop fallback"
+            self.capture_backend = "MSS client fallback"
         return frame
 
     def patched_capture_and_track(self):
@@ -145,13 +194,13 @@ def install_background_capture(capture_class) -> None:
                 self._frame_times.popleft()
             if len(self._frame_times) >= 2:
                 elapsed = self._frame_times[-1] - self._frame_times[0]
-                if elapsed > 0:
-                    self.fps = (len(self._frame_times) - 1) / elapsed
+                self.fps = ((len(self._frame_times) - 1) / elapsed) if elapsed > 0 else 0.0
             else:
                 self.fps = 0.0
         return ok
 
     capture_class.__init__ = patched_init
+    capture_class._refresh_window = patched_refresh_window
     capture_class.screenshot = patched_screenshot
     capture_class._capture_and_track = patched_capture_and_track
     capture_class._background_capture_patch_installed = True
