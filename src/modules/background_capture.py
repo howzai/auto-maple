@@ -1,8 +1,14 @@
-"""Occlusion-resistant client-area capture and bounded FPS tracking.
+"""Stable client-area capture with adaptive foreground/background backends.
 
-Both PrintWindow and MSS are kept in the same client-area coordinate system. This
-avoids calibration drift caused by mixing whole-window coordinates (title bar and
-borders included) with client-only rendered pixels.
+The Capture class upstream tracks the outer window rectangle.  Background capture
+uses client-area pixels.  These coordinate systems must never overwrite each
+other during the upstream window-change comparison, otherwise every frame looks
+like a resize and minimap calibration continuously resets.
+
+When the game is foreground, MSS is preferred for maximum FPS.  When the game is
+in the background, PrintWindow is preferred so ordinary overlapping windows do
+not contaminate the captured image.  PrintWindow support remains dependent on the
+game and graphics stack and is usually slower than desktop capture.
 """
 
 from __future__ import annotations
@@ -60,7 +66,7 @@ def _client_screen_rect(handle: int):
 
 
 def _print_client_bgra(handle: int, width: int, height: int) -> Optional[np.ndarray]:
-    """Render only the target window's client area into a BGRA image."""
+    """Render only the target window client area into a BGRA image."""
     if not handle or width <= 0 or height <= 0:
         return None
 
@@ -69,7 +75,6 @@ def _print_client_bgra(handle: int, width: int, height: int) -> Optional[np.ndar
     memory_dc = None
     bitmap = None
     try:
-        # GetDC targets the client area; GetWindowDC would include non-client chrome.
         hwnd_dc = user32.GetDC(handle)
         if not hwnd_dc:
             return None
@@ -118,7 +123,7 @@ def _print_client_bgra(handle: int, width: int, height: int) -> Optional[np.ndar
 
 
 def install_background_capture(capture_class) -> None:
-    """Patch Capture with aligned client capture and rolling FPS metrics."""
+    """Patch Capture with stable client coordinates and adaptive capture."""
     if getattr(capture_class, "_background_capture_patch_installed", False):
         return
 
@@ -135,42 +140,69 @@ def install_background_capture(capture_class) -> None:
         self._background_failures = 0
         self._background_retry_after = 0.0
         self._client_rect = None
+        self._outer_window_rect = None
 
     def patched_refresh_window(self):
-        previous_rect = dict(getattr(self, "window", {}) or {})
+        # Upstream compares self.window against GetWindowRect. Restore the last
+        # outer rectangle before calling it so a client rectangle is never
+        # mistaken for a resize on every frame.
+        if self._outer_window_rect is not None:
+            self.window = dict(self._outer_window_rect)
+
+        old_handle = int(getattr(self, "_handle", 0))
+        previous_client = dict(self._client_rect) if self._client_rect else None
         ok = original_refresh_window(self)
         if not ok:
             self._client_rect = None
+            self._outer_window_rect = None
             return False
+
+        # original_refresh_window has now populated the true outer rectangle.
+        outer_rect = dict(getattr(self, "window", {}) or {})
+        self._outer_window_rect = outer_rect
 
         client_rect = _client_screen_rect(int(getattr(self, "_handle", 0)))
         if client_rect is None:
+            self.window = outer_rect
             return True
 
-        # Use one coordinate space for calibration, tracking, PrintWindow and MSS.
-        changed = client_rect != self._client_rect
+        handle_changed = old_handle not in (0, int(getattr(self, "_handle", 0)))
+        client_changed = previous_client is not None and client_rect != previous_client
         self._client_rect = dict(client_rect)
         self.window = dict(client_rect)
-        if changed and previous_rect != client_rect:
+
+        # Only a real handle/client-size change invalidates calibration. Merely
+        # switching between outer/client coordinate representations does not.
+        if handle_changed or client_changed:
             self.calibrated = False
             if hasattr(self, "_reset_tracking"):
                 self._reset_tracking()
         return True
 
+    def _mss_client(self, delay: float):
+        # original_screenshot reads self.window. At this point it is the client
+        # screen rectangle, so MSS and PrintWindow return identical dimensions.
+        frame = original_screenshot(self, delay=delay)
+        if frame is not None:
+            self.capture_backend = "MSS client foreground"
+        return frame
+
     def patched_screenshot(self, delay: float = 1.0):
         now = time.monotonic()
+        handle = int(getattr(self, "_handle", 0))
         rect = self._client_rect or self.window
         width = int(rect.get("width", 0))
         height = int(rect.get("height", 0))
 
+        # MSS is much faster and is safe when the game owns the foreground.
+        if handle and user32.GetForegroundWindow() == handle:
+            return _mss_client(self, delay)
+
+        # In the background, prefer an occlusion-resistant rendered frame.
         if now >= self._background_retry_after:
-            frame = _print_client_bgra(
-                int(getattr(self, "_handle", 0)),
-                width,
-                height,
-            )
+            frame = _print_client_bgra(handle, width, height)
             if frame is not None:
-                self.capture_backend = "PrintWindow client"
+                self.capture_backend = "PrintWindow client background"
                 self._background_failures = 0
                 return frame
 
@@ -179,10 +211,11 @@ def install_background_capture(capture_class) -> None:
                 self._background_retry_after = now + 2.0
                 self._background_failures = 0
 
-        # original_screenshot reads self.window, now also client-area aligned.
-        frame = original_screenshot(self, delay=delay)
+        # If PrintWindow is unsupported, preserve functionality with desktop
+        # capture. This fallback may include overlapping windows.
+        frame = _mss_client(self, delay)
         if frame is not None:
-            self.capture_backend = "MSS client fallback"
+            self.capture_backend = "MSS client background fallback"
         return frame
 
     def patched_capture_and_track(self):
