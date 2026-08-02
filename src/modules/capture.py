@@ -1,146 +1,315 @@
-"""A module for tracking useful in-game information."""
+"""Screen capture, minimap calibration, and player-position tracking.
 
-import time
-import cv2
-import threading
+This module deliberately fails safe: when the game window disappears, is minimized,
+or the minimap/player cannot be located reliably, automation is paused and held keys
+are released.
+"""
+
+from __future__ import annotations
+
 import ctypes
+import sys
+import threading
+import time
+import traceback
+from pathlib import Path
+from typing import Optional, Tuple
+
+import cv2
 import mss
 import mss.windows
 import numpy as np
-from src.common import config, utils
 from ctypes import wintypes
+
+from src.common import config, utils
+from src.common.vkeys import release_all
+
+
 user32 = ctypes.windll.user32
-user32.SetProcessDPIAware()
+try:
+    user32.SetProcessDPIAware()
+except Exception:
+    pass
 
+GAME_WINDOW_TITLE = "MapleStory"
+TARGET_FPS = 30
+FRAME_INTERVAL = 1.0 / TARGET_FPS
+WINDOW_RETRY_DELAY = 1.0
+CALIBRATION_RETRY_DELAY = 0.5
+MINIMAP_MATCH_THRESHOLD = 0.72
+PLAYER_MATCH_THRESHOLD = 0.80
+PLAYER_LOST_TIMEOUT = 1.5
 
-# The distance between the top of the minimap and the top of the screen
 MINIMAP_TOP_BORDER = 5
-
-# The thickness of the other three borders of the minimap
 MINIMAP_BOTTOM_BORDER = 9
 
-# Offset in pixels to adjust for windowed mode
-WINDOWED_OFFSET_TOP = 36
-WINDOWED_OFFSET_LEFT = 10
 
-# The top-left and bottom-right corners of the minimap
-MM_TL_TEMPLATE = cv2.imread('assets/minimap_tl_template.png', 0)
-MM_BR_TEMPLATE = cv2.imread('assets/minimap_br_template.png', 0)
+def _project_root() -> Path:
+    """Return a stable project root in source and PyInstaller environments."""
+
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return Path(sys._MEIPASS)
+    return Path(__file__).resolve().parents[2]
+
+
+def _load_template(relative_path: str) -> np.ndarray:
+    path = _project_root() / relative_path
+    image = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+    if image is None:
+        raise FileNotFoundError(f"Required image template could not be loaded: {path}")
+    return image
+
+
+MM_TL_TEMPLATE = _load_template("assets/minimap_tl_template.png")
+MM_BR_TEMPLATE = _load_template("assets/minimap_br_template.png")
+PLAYER_TEMPLATE = _load_template("assets/player_template.png")
 
 MMT_HEIGHT = max(MM_TL_TEMPLATE.shape[0], MM_BR_TEMPLATE.shape[0])
 MMT_WIDTH = max(MM_TL_TEMPLATE.shape[1], MM_BR_TEMPLATE.shape[1])
-
-# The player's symbol on the minimap
-PLAYER_TEMPLATE = cv2.imread('assets/player_template.png', 0)
 PT_HEIGHT, PT_WIDTH = PLAYER_TEMPLATE.shape
 
 
 class Capture:
-    """
-    A class that tracks player position and various in-game events. It constantly updates
-    the config module with information regarding these events. It also annotates and
-    displays the minimap in a pop-up window.
-    """
+    """Continuously capture the game and publish safe minimap state."""
 
     def __init__(self):
-        """Initializes this Capture object's main thread."""
-
         config.capture = self
 
-        self.frame = None
+        self.frame: Optional[np.ndarray] = None
         self.minimap = {}
-        self.minimap_ratio = 1
-        self.minimap_sample = None
-        self.sct = None
-        self.window = {
-            'left': 0,
-            'top': 0,
-            'width': 1366,
-            'height': 768
-        }
+        self.minimap_ratio = 1.0
+        self.minimap_sample: Optional[np.ndarray] = None
+        self.sct: Optional[mss.mss] = None
+        self.window = {"left": 0, "top": 0, "width": 1366, "height": 768}
 
         self.ready = False
         self.calibrated = False
-        self.thread = threading.Thread(target=self._main)
-        self.thread.daemon = True
+        self.window_found = False
+        self.player_found = False
+        self.last_error: Optional[str] = None
+        self.last_frame_time = 0.0
+        self.last_player_seen = 0.0
+        self.frame_id = 0
+
+        self._handle = 0
+        self._state_lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self.thread = threading.Thread(
+            target=self._main,
+            name="auto-maple-capture",
+            daemon=True,
+        )
 
     def start(self):
-        """Starts this Capture's thread."""
-
-        print('\n[~] Started video capture')
+        print("\n[~] Started video capture")
         self.thread.start()
 
+    def stop(self):
+        self._stop_event.set()
+        self._pause_for_safety("Capture stopped")
+
     def _main(self):
-        """Constantly monitors the player's position and in-game events."""
+        """Wait for the window, calibrate, then track at a bounded frame rate."""
 
         mss.windows.CAPTUREBLT = 0
-        while True:
-            # Calibrate screen capture
-            handle = user32.FindWindowW(None, 'MapleStory')
-            rect = wintypes.RECT()
-            user32.GetWindowRect(handle, ctypes.pointer(rect))
-            rect = (rect.left, rect.top, rect.right, rect.bottom)
-            rect = tuple(max(0, x) for x in rect)
+        self.ready = True  # The service is ready even if the game has not opened yet.
 
-            self.window['left'] = rect[0]
-            self.window['top'] = rect[1]
-            self.window['width'] = max(rect[2] - rect[0], MMT_WIDTH)
-            self.window['height'] = max(rect[3] - rect[1], MMT_HEIGHT)
-
-            # Calibrate by finding the top-left and bottom-right corners of the minimap
-            with mss.mss() as self.sct:
-                self.frame = self.screenshot()
-            if self.frame is None:
-                continue
-            tl, _ = utils.single_match(self.frame, MM_TL_TEMPLATE)
-            _, br = utils.single_match(self.frame, MM_BR_TEMPLATE)
-            mm_tl = (
-                tl[0] + MINIMAP_BOTTOM_BORDER,
-                tl[1] + MINIMAP_TOP_BORDER
-            )
-            mm_br = (
-                max(mm_tl[0] + PT_WIDTH, br[0] - MINIMAP_BOTTOM_BORDER),
-                max(mm_tl[1] + PT_HEIGHT, br[1] - MINIMAP_BOTTOM_BORDER)
-            )
-            self.minimap_ratio = (mm_br[0] - mm_tl[0]) / (mm_br[1] - mm_tl[1])
-            self.minimap_sample = self.frame[mm_tl[1]:mm_br[1], mm_tl[0]:mm_br[0]]
-            self.calibrated = True
-
-            with mss.mss() as self.sct:
-                while True:
-                    if not self.calibrated:
-                        break
-
-                    # Take screenshot
-                    self.frame = self.screenshot()
-                    if self.frame is None:
+        try:
+            with mss.mss() as sct:
+                self.sct = sct
+                while not self._stop_event.is_set():
+                    if not self._refresh_window():
+                        self._pause_for_safety("Waiting for MapleStory window")
+                        time.sleep(WINDOW_RETRY_DELAY)
                         continue
 
-                    # Crop the frame to only show the minimap
-                    minimap = self.frame[mm_tl[1]:mm_br[1], mm_tl[0]:mm_br[0]]
+                    if not self.calibrated:
+                        if not self._calibrate_minimap():
+                            time.sleep(CALIBRATION_RETRY_DELAY)
+                            continue
 
-                    # Determine the player's position
-                    player = utils.multi_match(minimap, PLAYER_TEMPLATE, threshold=0.8)
-                    if player:
-                        config.player_pos = utils.convert_to_relative(player[0], minimap)
+                    started = time.perf_counter()
+                    if not self._capture_and_track():
+                        self.calibrated = False
 
-                    # Package display information to be polled by GUI
-                    self.minimap = {
-                        'minimap': minimap,
-                        'rune_active': config.bot.rune_active,
-                        'rune_pos': config.bot.rune_pos,
-                        'path': config.path,
-                        'player_pos': config.player_pos
-                    }
+                    remaining = FRAME_INTERVAL - (time.perf_counter() - started)
+                    if remaining > 0:
+                        time.sleep(remaining)
+        except Exception as exc:
+            self.last_error = f"{type(exc).__name__}: {exc}"
+            self._pause_for_safety("Capture thread crashed")
+            print("\n[!] Capture thread stopped unexpectedly:")
+            traceback.print_exc()
+        finally:
+            self.sct = None
+            self.window_found = False
+            self.calibrated = False
 
-                    if not self.ready:
-                        self.ready = True
-                    time.sleep(0.001)
+    def _refresh_window(self) -> bool:
+        handle = user32.FindWindowW(None, GAME_WINDOW_TITLE)
+        if not handle or not user32.IsWindow(handle) or user32.IsIconic(handle):
+            self._handle = 0
+            self.window_found = False
+            self.calibrated = False
+            return False
 
-    def screenshot(self, delay=1):
+        rect = wintypes.RECT()
+        if not user32.GetWindowRect(handle, ctypes.pointer(rect)):
+            self.window_found = False
+            self.calibrated = False
+            return False
+
+        width = rect.right - rect.left
+        height = rect.bottom - rect.top
+        if width < MMT_WIDTH or height < MMT_HEIGHT:
+            self.window_found = False
+            self.calibrated = False
+            return False
+
+        new_window = {
+            "left": max(0, rect.left),
+            "top": max(0, rect.top),
+            "width": width,
+            "height": height,
+        }
+
+        # A moved or resized window invalidates the old minimap crop.
+        if self._handle and (handle != self._handle or new_window != self.window):
+            self.calibrated = False
+
+        self._handle = handle
+        self.window = new_window
+        self.window_found = True
+        return True
+
+    @staticmethod
+    def _best_match(frame: np.ndarray, template: np.ndarray):
+        if frame is None or frame.size == 0:
+            return None
+        if template.shape[0] > frame.shape[0] or template.shape[1] > frame.shape[1]:
+            return None
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGRA2GRAY if frame.shape[2] == 4 else cv2.COLOR_BGR2GRAY)
+        result = cv2.matchTemplate(gray, template, cv2.TM_CCOEFF_NORMED)
+        _, score, _, top_left = cv2.minMaxLoc(result)
+        h, w = template.shape
+        return float(score), top_left, (top_left[0] + w, top_left[1] + h)
+
+    def _calibrate_minimap(self) -> bool:
+        frame = self.screenshot(delay=0)
+        if frame is None:
+            return False
+
+        tl_match = self._best_match(frame, MM_TL_TEMPLATE)
+        br_match = self._best_match(frame, MM_BR_TEMPLATE)
+        if not tl_match or not br_match:
+            return False
+
+        tl_score, tl, _ = tl_match
+        br_score, _, br = br_match
+        if tl_score < MINIMAP_MATCH_THRESHOLD or br_score < MINIMAP_MATCH_THRESHOLD:
+            self.last_error = (
+                f"Minimap calibration confidence too low "
+                f"(top-left={tl_score:.2f}, bottom-right={br_score:.2f})"
+            )
+            return False
+
+        mm_tl = (tl[0] + MINIMAP_BOTTOM_BORDER, tl[1] + MINIMAP_TOP_BORDER)
+        mm_br = (
+            max(mm_tl[0] + PT_WIDTH, br[0] - MINIMAP_BOTTOM_BORDER),
+            max(mm_tl[1] + PT_HEIGHT, br[1] - MINIMAP_BOTTOM_BORDER),
+        )
+
+        if mm_br[0] > frame.shape[1] or mm_br[1] > frame.shape[0]:
+            self.last_error = "Detected minimap bounds exceed captured frame"
+            return False
+
+        width = mm_br[0] - mm_tl[0]
+        height = mm_br[1] - mm_tl[1]
+        if width <= 0 or height <= 0:
+            self.last_error = "Detected minimap has invalid dimensions"
+            return False
+
+        sample = frame[mm_tl[1]:mm_br[1], mm_tl[0]:mm_br[0]]
+        if sample.size == 0:
+            return False
+
+        with self._state_lock:
+            self._minimap_tl = mm_tl
+            self._minimap_br = mm_br
+            self.minimap_ratio = width / height
+            self.minimap_sample = sample.copy()
+            self.frame = frame
+            self.calibrated = True
+            self.last_error = None
+
+        print(
+            f"\n[~] Minimap calibrated "
+            f"(confidence {min(tl_score, br_score):.2f}, {width}x{height})"
+        )
+        return True
+
+    def _capture_and_track(self) -> bool:
+        if not self._refresh_window():
+            self._pause_for_safety("MapleStory window lost")
+            return False
+
+        frame = self.screenshot(delay=0)
+        if frame is None:
+            return False
+
+        x1, y1 = self._minimap_tl
+        x2, y2 = self._minimap_br
+        if y2 > frame.shape[0] or x2 > frame.shape[1]:
+            return False
+
+        minimap = frame[y1:y2, x1:x2]
+        if minimap.size == 0:
+            return False
+
+        player = utils.multi_match(minimap, PLAYER_TEMPLATE, threshold=PLAYER_MATCH_THRESHOLD)
+        now = time.monotonic()
+        if player:
+            new_position = utils.convert_to_relative(player[0], minimap)
+            config.player_pos = new_position
+            self.last_player_seen = now
+            self.player_found = True
+        else:
+            self.player_found = False
+            if self.last_player_seen and now - self.last_player_seen > PLAYER_LOST_TIMEOUT:
+                self._pause_for_safety("Player marker lost")
+
+        with self._state_lock:
+            self.frame = frame
+            self.frame_id += 1
+            self.last_frame_time = now
+            self.minimap = {
+                "minimap": minimap.copy(),
+                "rune_active": bool(getattr(config.bot, "rune_active", False)),
+                "rune_pos": getattr(config.bot, "rune_pos", (0, 0)),
+                "path": list(config.path),
+                "player_pos": config.player_pos,
+                "player_found": self.player_found,
+                "window_found": self.window_found,
+                "frame_id": self.frame_id,
+            }
+        return True
+
+    def _pause_for_safety(self, reason: str):
+        was_enabled = bool(config.enabled)
+        config.enabled = False
+        release_all()
+        if was_enabled:
+            print(f"\n[!] Auto Maple paused for safety: {reason}")
+
+    def screenshot(self, delay: float = 1.0) -> Optional[np.ndarray]:
+        if self.sct is None or not self.window_found:
+            return None
         try:
-            return np.array(self.sct.grab(self.window))
-        except mss.exception.ScreenShotError:
-            print(f'\n[!] Error while taking screenshot, retrying in {delay} second'
-                  + ('s' if delay != 1 else ''))
-            time.sleep(delay)
+            return np.asarray(self.sct.grab(self.window))
+        except (mss.exception.ScreenShotError, ValueError) as exc:
+            self.last_error = f"Screenshot failed: {exc}"
+            if delay:
+                print(f"\n[!] Error while taking screenshot; retrying in {delay:g} second(s)")
+                time.sleep(delay)
+            return None
