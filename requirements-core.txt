@@ -1,11 +1,11 @@
-# Recommended environment: 64-bit Python 3.10 on Windows
+# Recommended environment: 64-bit Python 3.13 on Windows
 # Install with: python -m pip install -r requirements-core.txt
 
 GitPython>=3.1,<4
 keyboard>=0.13.5,<1
-mss>=9,<11
-numpy>=1.23,<2
-opencv-python-headless>=4.8,<5
-Pillow>=9.5,<12
-pygame>=2.5,<3
-pywin32>=306
+mss>=10,<11
+numpy>=2.0,<3
+opencv-python-headless>=4.10,<5
+Pillow>=11,<13
+pygame>=2.6,<3
+pywin32>=308
