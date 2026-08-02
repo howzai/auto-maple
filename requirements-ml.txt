@@ -1,0 +1,9 @@
+# Optional Rune model support.
+# Install only after the core environment is working:
+#   python -m pip install -r requirements-ml.txt
+#
+# TensorFlow compatibility depends on the selected Python, CPU/GPU, CUDA, and
+# Windows setup. Keep it separate so capture and GUI diagnostics can be tested
+# without a large ML installation.
+
+tensorflow>=2.10,<2.16; python_version == "3.10"
