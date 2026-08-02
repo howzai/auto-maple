@@ -46,11 +46,11 @@ def load_model():
 
 
 def classic_player_candidates(minimap: np.ndarray) -> List[PlayerCandidate]:
-    """Find cyan/blue player markers used by the Traditional Chinese classic UI.
+    """Find the yellow self-marker used by the Traditional Chinese classic UI.
 
-    The function is deliberately bounded: connected components are filtered by
-    size and only the strongest eight candidates are returned. This prevents a
-    noisy minimap from stalling the capture thread.
+    In this client, yellow represents the local player while red represents other
+    players. Red pixels are explicitly rejected. The search is bounded so noisy
+    minimaps cannot stall the capture thread.
     """
     if minimap is None or minimap.size == 0 or minimap.ndim != 3:
         return []
@@ -58,11 +58,17 @@ def classic_player_candidates(minimap: np.ndarray) -> List[PlayerCandidate]:
     bgr = minimap[:, :, :3]
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
 
-    # Classic-client player markers are bright cyan/blue. Two overlapping ranges
-    # tolerate display scaling and compression without accepting red/yellow NPC dots.
-    mask_cyan = cv2.inRange(hsv, (78, 75, 135), (105, 255, 255))
-    mask_blue = cv2.inRange(hsv, (106, 90, 120), (132, 255, 255))
-    mask = cv2.bitwise_or(mask_cyan, mask_blue)
+    # Local player: bright yellow / yellow-orange. The two ranges tolerate display
+    # scaling and slight color shifts while staying well away from red markers.
+    mask_yellow = cv2.inRange(hsv, (20, 105, 145), (39, 255, 255))
+    mask_yellow_orange = cv2.inRange(hsv, (14, 135, 170), (25, 255, 255))
+    mask = cv2.bitwise_or(mask_yellow, mask_yellow_orange)
+
+    # Other players are red. Remove both red hue bands before component analysis.
+    mask_red_low = cv2.inRange(hsv, (0, 90, 110), (10, 255, 255))
+    mask_red_high = cv2.inRange(hsv, (170, 90, 110), (179, 255, 255))
+    red_mask = cv2.bitwise_or(mask_red_low, mask_red_high)
+    mask[red_mask > 0] = 0
 
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
@@ -74,7 +80,7 @@ def classic_player_candidates(minimap: np.ndarray) -> List[PlayerCandidate]:
 
     for index in range(1, count):
         x, y, component_w, component_h, area = stats[index]
-        if not 3 <= area <= 120:
+        if not 2 <= area <= 110:
             continue
         if not 2 <= component_w <= 18 or not 2 <= component_h <= 18:
             continue
@@ -91,19 +97,32 @@ def classic_player_candidates(minimap: np.ndarray) -> List[PlayerCandidate]:
         if component_hsv.size == 0 or not np.any(component_mask):
             continue
 
+        hues = component_hsv[:, :, 0][component_mask]
         saturation = float(np.mean(component_hsv[:, :, 1][component_mask])) / 255.0
         value = float(np.mean(component_hsv[:, :, 2][component_mask])) / 255.0
+        mean_hue = float(np.mean(hues))
+
+        # Reject components whose average hue drifts toward orange/red.
+        if not 14.0 <= mean_hue <= 39.0:
+            continue
+
         fill = area / float(max(component_w * component_h, 1))
-        size_score = 1.0 - min(1.0, abs(area - 18.0) / 70.0)
+        size_score = 1.0 - min(1.0, abs(area - 14.0) / 55.0)
+        hue_score = 1.0 - min(1.0, abs(mean_hue - 28.0) / 16.0)
         confidence = min(
             0.99,
-            0.30 + 0.25 * saturation + 0.20 * value + 0.15 * fill + 0.10 * size_score,
+            0.28
+            + 0.22 * saturation
+            + 0.20 * value
+            + 0.12 * fill
+            + 0.10 * size_score
+            + 0.08 * hue_score,
         )
         point = (float(cx) / max(width, 1), float(cy) / max(height, 1))
         candidates.append((point, confidence))
 
     candidates.sort(key=lambda item: item[1], reverse=True)
-    return candidates[:8]
+    return candidates[:6]
 
 
 def canny(image):
