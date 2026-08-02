@@ -1,19 +1,20 @@
 """Screen capture, minimap calibration, and player-position tracking.
 
-This module deliberately fails safe: when the game window disappears, is minimized,
-or the minimap/player cannot be located reliably, automation is paused and held keys
-are released.
+The capture service fails safe. When the game window disappears, is minimized, the
+capture stream stalls, or the minimap/player cannot be located reliably, automation
+is paused and all held keys are released.
 """
 
 from __future__ import annotations
 
 import ctypes
+import math
 import sys
 import threading
 import time
 import traceback
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Dict, Optional, Sequence, Tuple
 
 import cv2
 import mss
@@ -39,14 +40,23 @@ CALIBRATION_RETRY_DELAY = 0.5
 MINIMAP_MATCH_THRESHOLD = 0.72
 PLAYER_MATCH_THRESHOLD = 0.80
 PLAYER_LOST_TIMEOUT = 1.5
+CAPTURE_STALL_TIMEOUT = 2.5
+WATCHDOG_INTERVAL = 0.25
+
+# Player tracking parameters. Coordinates are normalized minimap coordinates.
+POSITION_EMA_ALPHA = 0.45
+MAX_NORMAL_JUMP = 0.18
+TELEPORT_CONFIRM_FRAMES = 3
+TELEPORT_CLUSTER_RADIUS = 0.08
 
 MINIMAP_TOP_BORDER = 5
 MINIMAP_BOTTOM_BORDER = 9
 
+Point = Tuple[float, float]
+
 
 def _project_root() -> Path:
     """Return a stable project root in source and PyInstaller environments."""
-
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
         return Path(sys._MEIPASS)
     return Path(__file__).resolve().parents[2]
@@ -69,6 +79,10 @@ MMT_WIDTH = max(MM_TL_TEMPLATE.shape[1], MM_BR_TEMPLATE.shape[1])
 PT_HEIGHT, PT_WIDTH = PLAYER_TEMPLATE.shape
 
 
+def _distance(a: Point, b: Point) -> float:
+    return math.hypot(a[0] - b[0], a[1] - b[1])
+
+
 class Capture:
     """Continuously capture the game and publish safe minimap state."""
 
@@ -76,7 +90,7 @@ class Capture:
         config.capture = self
 
         self.frame: Optional[np.ndarray] = None
-        self.minimap = {}
+        self.minimap: Dict[str, object] = {}
         self.minimap_ratio = 1.0
         self.minimap_sample: Optional[np.ndarray] = None
         self.sct: Optional[mss.mss] = None
@@ -90,29 +104,61 @@ class Capture:
         self.last_frame_time = 0.0
         self.last_player_seen = 0.0
         self.frame_id = 0
+        self.player_confidence = 0.0
+        self.rejected_player_jumps = 0
 
         self._handle = 0
-        self._state_lock = threading.Lock()
+        self._filtered_position: Optional[Point] = None
+        self._pending_jump: Optional[Point] = None
+        self._pending_jump_frames = 0
+        self._minimap_tl = (0, 0)
+        self._minimap_br = (0, 0)
+        self._state_lock = threading.RLock()
         self._stop_event = threading.Event()
         self.thread = threading.Thread(
             target=self._main,
             name="auto-maple-capture",
             daemon=True,
         )
+        self.watchdog_thread = threading.Thread(
+            target=self._watchdog,
+            name="auto-maple-capture-watchdog",
+            daemon=True,
+        )
 
     def start(self):
         print("\n[~] Started video capture")
         self.thread.start()
+        self.watchdog_thread.start()
 
     def stop(self):
         self._stop_event.set()
         self._pause_for_safety("Capture stopped")
 
+    def health_snapshot(self) -> Dict[str, object]:
+        """Return an immutable diagnostic snapshot for GUI/logging code."""
+        with self._state_lock:
+            age = None
+            if self.last_frame_time:
+                age = max(0.0, time.monotonic() - self.last_frame_time)
+            return {
+                "ready": self.ready,
+                "thread_alive": self.thread.is_alive(),
+                "watchdog_alive": self.watchdog_thread.is_alive(),
+                "window_found": self.window_found,
+                "calibrated": self.calibrated,
+                "player_found": self.player_found,
+                "player_confidence": self.player_confidence,
+                "frame_id": self.frame_id,
+                "last_frame_age": age,
+                "rejected_player_jumps": self.rejected_player_jumps,
+                "last_error": self.last_error,
+            }
+
     def _main(self):
         """Wait for the window, calibrate, then track at a bounded frame rate."""
-
         mss.windows.CAPTUREBLT = 0
-        self.ready = True  # The service is ready even if the game has not opened yet.
+        self.ready = True
 
         try:
             with mss.mss() as sct:
@@ -145,18 +191,50 @@ class Capture:
             self.window_found = False
             self.calibrated = False
 
+    def _watchdog(self):
+        """Pause automation when the capture worker dies or stops producing frames."""
+        while not self._stop_event.is_set():
+            time.sleep(WATCHDOG_INTERVAL)
+            if not self.ready:
+                continue
+
+            if not self.thread.is_alive():
+                self.last_error = self.last_error or "Capture worker is not running"
+                self._pause_for_safety("Capture worker stopped")
+                return
+
+            if not self.window_found or not self.calibrated or not self.last_frame_time:
+                continue
+
+            frame_age = time.monotonic() - self.last_frame_time
+            if frame_age > CAPTURE_STALL_TIMEOUT:
+                self.last_error = f"Capture stalled for {frame_age:.2f} seconds"
+                self.calibrated = False
+                self._pause_for_safety("Capture stream stalled")
+
+    def _reset_tracking(self):
+        with self._state_lock:
+            self.player_found = False
+            self.player_confidence = 0.0
+            self._filtered_position = None
+            self._pending_jump = None
+            self._pending_jump_frames = 0
+            self.last_player_seen = 0.0
+
     def _refresh_window(self) -> bool:
         handle = user32.FindWindowW(None, GAME_WINDOW_TITLE)
         if not handle or not user32.IsWindow(handle) or user32.IsIconic(handle):
             self._handle = 0
             self.window_found = False
             self.calibrated = False
+            self._reset_tracking()
             return False
 
         rect = wintypes.RECT()
         if not user32.GetWindowRect(handle, ctypes.pointer(rect)):
             self.window_found = False
             self.calibrated = False
+            self._reset_tracking()
             return False
 
         width = rect.right - rect.left
@@ -164,6 +242,7 @@ class Capture:
         if width < MMT_WIDTH or height < MMT_HEIGHT:
             self.window_found = False
             self.calibrated = False
+            self._reset_tracking()
             return False
 
         new_window = {
@@ -173,9 +252,9 @@ class Capture:
             "height": height,
         }
 
-        # A moved or resized window invalidates the old minimap crop.
         if self._handle and (handle != self._handle or new_window != self.window):
             self.calibrated = False
+            self._reset_tracking()
 
         self._handle = handle
         self.window = new_window
@@ -189,7 +268,8 @@ class Capture:
         if template.shape[0] > frame.shape[0] or template.shape[1] > frame.shape[1]:
             return None
 
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGRA2GRAY if frame.shape[2] == 4 else cv2.COLOR_BGR2GRAY)
+        conversion = cv2.COLOR_BGRA2GRAY if frame.shape[2] == 4 else cv2.COLOR_BGR2GRAY
+        gray = cv2.cvtColor(frame, conversion)
         result = cv2.matchTemplate(gray, template, cv2.TM_CCOEFF_NORMED)
         _, score, _, top_left = cv2.minMaxLoc(result)
         h, w = template.shape
@@ -209,7 +289,7 @@ class Capture:
         br_score, _, br = br_match
         if tl_score < MINIMAP_MATCH_THRESHOLD or br_score < MINIMAP_MATCH_THRESHOLD:
             self.last_error = (
-                f"Minimap calibration confidence too low "
+                "Minimap calibration confidence too low "
                 f"(top-left={tl_score:.2f}, bottom-right={br_score:.2f})"
             )
             return False
@@ -242,12 +322,93 @@ class Capture:
             self.frame = frame
             self.calibrated = True
             self.last_error = None
+            self._reset_tracking()
 
         print(
             f"\n[~] Minimap calibrated "
             f"(confidence {min(tl_score, br_score):.2f}, {width}x{height})"
         )
         return True
+
+    def _player_candidates(self, minimap: np.ndarray) -> Sequence[Tuple[Point, float]]:
+        """Return normalized player candidates with template confidence scores."""
+        conversion = cv2.COLOR_BGRA2GRAY if minimap.shape[2] == 4 else cv2.COLOR_BGR2GRAY
+        gray = cv2.cvtColor(minimap, conversion)
+        if PLAYER_TEMPLATE.shape[0] > gray.shape[0] or PLAYER_TEMPLATE.shape[1] > gray.shape[1]:
+            return []
+
+        result = cv2.matchTemplate(gray, PLAYER_TEMPLATE, cv2.TM_CCOEFF_NORMED)
+        ys, xs = np.where(result >= PLAYER_MATCH_THRESHOLD)
+        candidates = []
+        for x, y in zip(xs, ys):
+            center = (
+                int(round(x + PLAYER_TEMPLATE.shape[1] / 2)),
+                int(round(y + PLAYER_TEMPLATE.shape[0] / 2)),
+            )
+            relative = utils.convert_to_relative(center, minimap)
+            candidates.append((relative, float(result[y, x])))
+
+        # Remove near-duplicate template hits, retaining the strongest result.
+        candidates.sort(key=lambda item: item[1], reverse=True)
+        deduplicated = []
+        for point, score in candidates:
+            if all(_distance(point, existing[0]) > 0.025 for existing in deduplicated):
+                deduplicated.append((point, score))
+        return deduplicated
+
+    def _select_player_candidate(
+        self, candidates: Sequence[Tuple[Point, float]]
+    ) -> Optional[Tuple[Point, float]]:
+        if not candidates:
+            return None
+        if self._filtered_position is None:
+            return max(candidates, key=lambda item: item[1])
+
+        # Prefer temporal continuity, with confidence as a small tie-breaker.
+        return min(
+            candidates,
+            key=lambda item: _distance(item[0], self._filtered_position) - item[1] * 0.02,
+        )
+
+    def _accept_position(self, position: Point) -> Optional[Point]:
+        """Smooth normal motion and require confirmation for large coordinate jumps."""
+        if self._filtered_position is None:
+            self._filtered_position = position
+            return position
+
+        jump = _distance(position, self._filtered_position)
+        if jump <= MAX_NORMAL_JUMP:
+            self._pending_jump = None
+            self._pending_jump_frames = 0
+            alpha = POSITION_EMA_ALPHA
+            filtered = (
+                alpha * position[0] + (1.0 - alpha) * self._filtered_position[0],
+                alpha * position[1] + (1.0 - alpha) * self._filtered_position[1],
+            )
+            self._filtered_position = filtered
+            return filtered
+
+        # A large jump may be a portal/teleport or a false template match. Accept only
+        # after several consecutive frames agree on the new region.
+        if self._pending_jump is None or _distance(position, self._pending_jump) > TELEPORT_CLUSTER_RADIUS:
+            self._pending_jump = position
+            self._pending_jump_frames = 1
+        else:
+            self._pending_jump = (
+                (self._pending_jump[0] + position[0]) / 2,
+                (self._pending_jump[1] + position[1]) / 2,
+            )
+            self._pending_jump_frames += 1
+
+        if self._pending_jump_frames >= TELEPORT_CONFIRM_FRAMES:
+            self._filtered_position = self._pending_jump
+            accepted = self._filtered_position
+            self._pending_jump = None
+            self._pending_jump_frames = 0
+            return accepted
+
+        self.rejected_player_jumps += 1
+        return None
 
     def _capture_and_track(self) -> bool:
         if not self._refresh_window():
@@ -267,17 +428,30 @@ class Capture:
         if minimap.size == 0:
             return False
 
-        player = utils.multi_match(minimap, PLAYER_TEMPLATE, threshold=PLAYER_MATCH_THRESHOLD)
         now = time.monotonic()
-        if player:
-            new_position = utils.convert_to_relative(player[0], minimap)
-            config.player_pos = new_position
+        candidates = self._player_candidates(minimap)
+        selected = self._select_player_candidate(candidates)
+        accepted_position = None
+
+        if selected is not None:
+            raw_position, confidence = selected
+            accepted_position = self._accept_position(raw_position)
+            self.player_confidence = confidence
+
+        if accepted_position is not None:
+            config.player_pos = accepted_position
             self.last_player_seen = now
             self.player_found = True
+        elif selected is not None and self._filtered_position is not None:
+            # A potential teleport is still being confirmed. Preserve the last valid
+            # coordinate, but do not claim a fresh successful detection.
+            self.player_found = False
         else:
             self.player_found = False
-            if self.last_player_seen and now - self.last_player_seen > PLAYER_LOST_TIMEOUT:
-                self._pause_for_safety("Player marker lost")
+            self.player_confidence = 0.0
+
+        if not self.player_found and self.last_player_seen and now - self.last_player_seen > PLAYER_LOST_TIMEOUT:
+            self._pause_for_safety("Player marker lost")
 
         with self._state_lock:
             self.frame = frame
@@ -290,8 +464,12 @@ class Capture:
                 "path": list(config.path),
                 "player_pos": config.player_pos,
                 "player_found": self.player_found,
+                "player_confidence": self.player_confidence,
+                "player_candidates": len(candidates),
                 "window_found": self.window_found,
+                "calibrated": self.calibrated,
                 "frame_id": self.frame_id,
+                "rejected_player_jumps": self.rejected_player_jumps,
             }
         return True
 
