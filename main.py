@@ -2,9 +2,9 @@
 
 import sys
 import time
-import traceback
 
 from src.common import config
+from src.common.logging_config import configure_logging, get_logger
 from src.common.vkeys import release_all
 from src.modules.bot import Bot
 from src.modules.capture import Capture
@@ -14,56 +14,66 @@ from src.modules.notifier import Notifier
 
 
 STARTUP_TIMEOUT_SECONDS = 30
+logger = get_logger("main")
 
 
 def _start_and_wait(component, display_name, timeout=STARTUP_TIMEOUT_SECONDS):
     """Start COMPONENT and wait for readiness without hanging forever."""
+    logger.info("Starting %s", display_name)
     component.start()
     deadline = time.monotonic() + timeout
 
     while not component.ready:
-        thread = getattr(component, 'thread', None)
+        thread = getattr(component, "thread", None)
         if thread is not None and not thread.is_alive():
-            raise RuntimeError(f'{display_name} stopped during initialization')
+            raise RuntimeError(f"{display_name} stopped during initialization")
         if time.monotonic() >= deadline:
             raise TimeoutError(
-                f'{display_name} did not become ready within {timeout} seconds'
+                f"{display_name} did not become ready within {timeout} seconds"
             )
         time.sleep(0.02)
+
+    logger.info("%s is ready", display_name)
 
 
 def main():
     """Initialize all modules and start the GUI."""
+    configure_logging()
+    logger.info("Auto Maple startup requested")
+
     bot = Bot()
     capture = Capture()
     notifier = Notifier()
     listener = Listener()
 
-    _start_and_wait(bot, 'Bot')
-    _start_and_wait(capture, 'Capture')
-    _start_and_wait(notifier, 'Notifier')
-    _start_and_wait(listener, 'Listener')
+    _start_and_wait(bot, "Bot")
+    _start_and_wait(capture, "Capture")
+    _start_and_wait(notifier, "Notifier")
+    _start_and_wait(listener, "Listener")
 
-    print('\n[~] Successfully initialized Auto Maple')
-    print('[~] Press F12 at any time for emergency stop')
+    logger.info("Successfully initialized Auto Maple")
+    print("\n[~] Successfully initialized Auto Maple")
+    print("[~] Press F12 at any time for emergency stop")
 
     gui = GUI()
     gui.start()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     exit_code = 0
     try:
         main()
     except KeyboardInterrupt:
-        print('\n[~] Auto Maple interrupted by user')
-    except Exception as exc:
+        logger.info("Auto Maple interrupted by user")
+        print("\n[~] Auto Maple interrupted by user")
+    except Exception:
         config.enabled = False
         exit_code = 1
-        print(f'\n[!] Auto Maple failed to start: {exc}')
-        traceback.print_exc()
+        logger.exception("Auto Maple failed to start")
+        print("\n[!] Auto Maple failed to start; see logs/auto-maple.log")
     finally:
         config.enabled = False
         release_all()
+        logger.info("Auto Maple shutdown complete with exit code %s", exit_code)
 
     sys.exit(exit_code)
