@@ -18,6 +18,7 @@ from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SUPPORTED_PYTHON = (3, 13)
 REQUIRED_ASSETS = (
     "assets/icon.png",
     "assets/icon.ico",
@@ -51,15 +52,15 @@ def _module_version(module) -> str:
 
 def main() -> int:
     print("Auto Maple environment check")
-    print("=" * 48)
+    print("=" * 56)
 
     checks = []
     checks.append(_result(platform.system() == "Windows", "Operating system", platform.platform()))
     checks.append(
         _result(
-            sys.version_info[:2] == (3, 10),
+            sys.version_info[:2] == SUPPORTED_PYTHON,
             "Python version",
-            f"{platform.python_version()} (recommended: 3.10.x)",
+            f"{platform.python_version()} (supported: 3.13.x)",
         )
     )
     checks.append(
@@ -71,7 +72,7 @@ def main() -> int:
     )
 
     print("\nPython packages")
-    print("-" * 48)
+    print("-" * 56)
     for import_name, package_name in REQUIRED_MODULES:
         try:
             module = importlib.import_module(import_name)
@@ -86,17 +87,20 @@ def main() -> int:
         except Exception as exc:
             _result(False, package_name, f"optional; unavailable: {exc}")
         else:
-            _result(True, package_name, _module_version(module))
+            version = _module_version(module)
+            compatible = import_name != "tensorflow" or version.startswith("2.21.")
+            detail = version if compatible else f"{version}; expected TensorFlow 2.21.x on Python 3.13"
+            _result(compatible, package_name, detail)
 
     print("\nRequired assets")
-    print("-" * 48)
+    print("-" * 56)
     for relative_path in REQUIRED_ASSETS:
         path = PROJECT_ROOT / relative_path
         checks.append(_result(path.is_file(), relative_path, str(path)))
 
     writable_targets = (PROJECT_ROOT / "logs", PROJECT_ROOT / "settings")
     print("\nWritable directories")
-    print("-" * 48)
+    print("-" * 56)
     for directory in writable_targets:
         try:
             directory.mkdir(parents=True, exist_ok=True)
@@ -108,9 +112,10 @@ def main() -> int:
         else:
             checks.append(_result(True, str(directory)))
 
-    print("\n" + "=" * 48)
+    print("\n" + "=" * 56)
     if all(checks):
-        print("Environment check passed. You can run: python main.py")
+        print("Core environment check passed. You can run: python main.py")
+        print("TensorFlow is optional; install requirements-ml.txt only for Rune model testing.")
         return 0
 
     print("Environment check failed. Fix the FAIL items before starting.")
