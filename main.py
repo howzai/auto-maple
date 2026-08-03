@@ -6,7 +6,6 @@ import time
 from src.common import config
 from src.common.logging_config import configure_logging, get_logger
 from src.common.vkeys import release_all
-from src.modules.background_capture import install_background_capture
 from src.modules.bot import Bot
 from src.modules.capture import Capture
 from src.modules.classic_minimap import install_classic_minimap_fallback
@@ -14,6 +13,7 @@ from src.modules.classic_player import install_classic_player_fallback
 from src.modules.gui import GUI
 from src.modules.listener import Listener
 from src.modules.notifier import Notifier
+from src.modules.wgc_capture_backend import install_wgc_capture
 
 
 STARTUP_TIMEOUT_SECONDS = 30
@@ -44,10 +44,10 @@ def main():
     configure_logging()
     logger.info("Auto Maple startup requested")
 
-    # Preserve upstream behavior and install conservative regional fallbacks.
-    # Background capture must be installed before Capture is instantiated so its
-    # FPS state and PrintWindow backend are initialized correctly.
-    install_background_capture(Capture)
+    # Windows Graphics Capture is the only frame source on this branch. It is
+    # installed before regional minimap/player fallbacks and before Capture is
+    # instantiated. There is intentionally no desktop-capture fallback.
+    install_wgc_capture(Capture)
     install_classic_minimap_fallback(Capture)
     install_classic_player_fallback(Capture)
 
@@ -63,6 +63,7 @@ def main():
 
     logger.info("Successfully initialized Auto Maple")
     print("\n[~] Successfully initialized Auto Maple")
+    print("[~] Capture backend: Windows Graphics Capture")
     print("[~] Press F12 at any time for emergency stop")
 
     gui = GUI()
@@ -83,6 +84,12 @@ if __name__ == "__main__":
         print("\n[!] Auto Maple failed to start; see logs/auto-maple.log")
     finally:
         config.enabled = False
+        capture = getattr(config, "capture", None)
+        if capture is not None:
+            try:
+                capture.stop()
+            except Exception:
+                logger.exception("Capture shutdown failed")
         release_all()
         logger.info("Auto Maple shutdown complete with exit code %s", exit_code)
 
