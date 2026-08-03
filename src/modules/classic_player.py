@@ -19,7 +19,6 @@ def _template_candidates(capture, minimap: np.ndarray) -> List[Candidate]:
     """Return only strong local maxima from the upstream player template."""
     template = capture.PLAYER_TEMPLATE if hasattr(capture, "PLAYER_TEMPLATE") else None
     if template is None:
-        # PLAYER_TEMPLATE is a module-level constant in capture.py.
         import src.modules.capture as capture_module
         template = capture_module.PLAYER_TEMPLATE
         threshold = capture_module.PLAYER_MATCH_THRESHOLD
@@ -32,9 +31,6 @@ def _template_candidates(capture, minimap: np.ndarray) -> List[Candidate]:
         return []
 
     result = cv2.matchTemplate(gray, template, cv2.TM_CCOEFF_NORMED)
-
-    # Keep local peaks only. The previous np.where() returned every pixel above
-    # threshold and could create thousands of candidates on a mismatched UI.
     dilated = cv2.dilate(result, np.ones((3, 3), dtype=np.uint8))
     peak_mask = (result >= threshold) & (result >= dilated - 1e-6)
     ys, xs = np.where(peak_mask)
@@ -71,24 +67,27 @@ def _deduplicate(candidates: List[Candidate]) -> List[Candidate]:
 
 
 def install_classic_player_fallback(capture_class) -> None:
-    """Replace unbounded player template matching with a bounded hybrid detector."""
+    """Prefer the classic client's yellow self-marker over legacy templates."""
     if getattr(capture_class, "_classic_player_patch_installed", False):
         return
 
     def bounded_player_candidates(self, minimap: np.ndarray):
-        template = _template_candidates(self, minimap)
         classic = detection.classic_player_candidates(minimap)
 
-        # Prefer the template when it has a genuinely strong match. Otherwise the
-        # classic cyan/blue marker detector supplies the fallback candidates.
-        combined = template + classic
-        candidates = _deduplicate(combined)
-        self.player_detection_method = (
-            "template" if template and template[0][1] >= 0.86
-            else "classic-color" if classic
-            else "none"
-        )
-        return candidates
+        # The classic client uses a yellow diamond for the local player. The
+        # upstream grayscale template often locks onto static map decorations,
+        # producing a high confidence position that never moves. Therefore a
+        # valid yellow-marker result must always take priority and must not be
+        # mixed with template candidates.
+        if classic:
+            self.player_detection_method = "classic-yellow"
+            return _deduplicate(classic)
+
+        # Retain the legacy template only as a last-resort fallback for maps or
+        # UI themes where the yellow marker is temporarily hidden.
+        template = _template_candidates(self, minimap)
+        self.player_detection_method = "template-fallback" if template else "none"
+        return _deduplicate(template)
 
     capture_class._player_candidates = bounded_player_candidates
     capture_class._classic_player_patch_installed = True
