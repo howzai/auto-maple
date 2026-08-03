@@ -220,7 +220,9 @@ internal static class CaptureInterop
 {
     private const string GraphicsCaptureItemRuntimeClass = "Windows.Graphics.Capture.GraphicsCaptureItem";
 
-    private static readonly Guid GraphicsCaptureItemGuid = typeof(GraphicsCaptureItem).GUID;
+    // ABI IID for Windows.Graphics.Capture.IGraphicsCaptureItem.
+    // CreateForWindow requires this interface IID, not the runtime-class GUID.
+    private static readonly Guid GraphicsCaptureItemGuid = new("79C3F95B-31F7-4EC2-A464-632EF5D30760");
     private static readonly Guid GraphicsCaptureItemInteropGuid = new("3628E81B-3CAC-4C60-B7F4-23CE0E0C3356");
     private static readonly Guid D3D11Texture2DGuid = typeof(ID3D11Texture2D).GUID;
 
