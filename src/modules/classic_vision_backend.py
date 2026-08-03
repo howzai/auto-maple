@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -15,6 +16,8 @@ Located = Tuple[Bounds, float, str]
 
 _MODEL = None
 _MODEL_ATTEMPTED = False
+RELOCALIZE_INTERVAL_SECONDS = 0.50
+RELOCALIZE_PIXEL_TOLERANCE = 3
 
 
 def _project_root() -> Path:
@@ -53,11 +56,6 @@ def _valid(frame: np.ndarray, bounds: Bounds) -> bool:
 
 
 def _find_with_yolo(frame: np.ndarray) -> Optional[Located]:
-    """Optionally locate the minimap using a trained UI model.
-
-    YOLO remains optional. Fixed UI localization is the normal fast path because
-    the minimap is anchored and does not need object detection every frame.
-    """
     model = _load_yolo()
     if model is None:
         return None
@@ -87,7 +85,6 @@ def _find_with_yolo(frame: np.ndarray) -> Optional[Located]:
 
 
 def locate_classic_minimap(frame: np.ndarray) -> Optional[Tuple[Located, Optional[FixedUiSnapshot]]]:
-    """Locate the minimap and return the complete fixed-UI snapshot when available."""
     snapshot = locate_fixed_ui(frame)
     if snapshot is not None:
         region = snapshot.minimap_canvas
@@ -99,10 +96,45 @@ def locate_classic_minimap(frame: np.ndarray) -> Optional[Tuple[Located, Optiona
     return None
 
 
+def _bounds_changed(old_bounds: Bounds, new_bounds: Bounds) -> bool:
+    old_values = (*old_bounds[0], *old_bounds[1])
+    new_values = (*new_bounds[0], *new_bounds[1])
+    return any(abs(old - new) > RELOCALIZE_PIXEL_TOLERANCE for old, new in zip(old_values, new_values))
+
+
+def _apply_location(self, frame, located, ui_snapshot, reset_tracking: bool) -> bool:
+    (top_left, bottom_right), score, method = located
+    x1, y1 = top_left
+    x2, y2 = bottom_right
+    sample = frame[y1:y2, x1:x2]
+    if sample.size == 0:
+        self.last_error = "Classic vision backend produced an empty minimap crop"
+        return False
+
+    width = x2 - x1
+    height = y2 - y1
+    with self._state_lock:
+        self._minimap_tl = top_left
+        self._minimap_br = bottom_right
+        self.minimap_ratio = width / max(height, 1)
+        self.minimap_sample = sample.copy()
+        self.frame = frame
+        self.calibrated = True
+        self.last_error = None
+        self.calibration_method = method
+        self.fixed_ui_snapshot = ui_snapshot
+        if reset_tracking:
+            self._reset_tracking()
+
+    return True
+
+
 def install_classic_vision_backend(capture_class) -> None:
-    """Replace minimap calibration with the classic fixed-UI backend."""
+    """Replace minimap calibration and keep its bounds synchronized with the UI."""
     if getattr(capture_class, "_classic_vision_backend_installed", False):
         return
+
+    original_capture_and_track = capture_class._capture_and_track
 
     def calibrate(self) -> bool:
         frame = self.screenshot(delay=0)
@@ -118,31 +150,16 @@ def install_classic_vision_backend(capture_class) -> None:
             return False
 
         located, ui_snapshot = result
+        if not _apply_location(self, frame, located, ui_snapshot, reset_tracking=True):
+            return False
+
         (top_left, bottom_right), score, method = located
         x1, y1 = top_left
         x2, y2 = bottom_right
-        sample = frame[y1:y2, x1:x2]
-        if sample.size == 0:
-            self.last_error = "Classic vision backend produced an empty minimap crop"
-            return False
-
-        width = x2 - x1
-        height = y2 - y1
-        with self._state_lock:
-            self._minimap_tl = top_left
-            self._minimap_br = bottom_right
-            self.minimap_ratio = width / max(height, 1)
-            self.minimap_sample = sample.copy()
-            self.frame = frame
-            self.calibrated = True
-            self.last_error = None
-            self.calibration_method = method
-            self.fixed_ui_snapshot = ui_snapshot
-            self._reset_tracking()
-
+        self._classic_last_relocalize = time.monotonic()
         print(
             f"\n[~] Classic minimap calibrated using {method} "
-            f"(score {score:.2f}, {width}x{height}, "
+            f"(score {score:.2f}, {x2 - x1}x{y2 - y1}, "
             f"bounds=({x1},{y1})-({x2},{y2}))"
         )
         if ui_snapshot is not None:
@@ -155,5 +172,33 @@ def install_classic_vision_backend(capture_class) -> None:
             )
         return True
 
+    def capture_and_track_with_relocalization(self) -> bool:
+        ok = original_capture_and_track(self)
+        if not ok or self.frame is None:
+            return ok
+
+        now = time.monotonic()
+        last = getattr(self, "_classic_last_relocalize", 0.0)
+        if now - last < RELOCALIZE_INTERVAL_SECONDS:
+            return ok
+        self._classic_last_relocalize = now
+
+        result = locate_classic_minimap(self.frame)
+        if result is None:
+            return ok
+
+        located, ui_snapshot = result
+        new_bounds = located[0]
+        old_bounds = (self._minimap_tl, self._minimap_br)
+        if _bounds_changed(old_bounds, new_bounds):
+            if _apply_location(self, self.frame, located, ui_snapshot, reset_tracking=True):
+                (x1, y1), (x2, y2) = new_bounds
+                print(
+                    "\n[~] Minimap layout changed; bounds refreshed "
+                    f"to ({x1},{y1})-({x2},{y2})"
+                )
+        return ok
+
     capture_class._calibrate_minimap = calibrate
+    capture_class._capture_and_track = capture_and_track_with_relocalization
     capture_class._classic_vision_backend_installed = True
