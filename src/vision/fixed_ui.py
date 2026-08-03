@@ -1,8 +1,8 @@
 """Fixed UI localization for the Traditional Chinese classic client.
 
-This module only describes and validates stable interface regions. It never sends
-input and never decides movement. All coordinates are relative to the captured game
-frame so the same layout can tolerate small changes in window borders and DPI.
+The minimap is located from its fixed panel chrome in the upper-left corner, not
+from changing map scenery. This keeps players, monsters and combat effects from
+being mistaken for the minimap and supports both wide and square map layouts.
 """
 
 from __future__ import annotations
@@ -65,73 +65,103 @@ def _clip_bounds(frame: np.ndarray, bounds: Bounds) -> Optional[Bounds]:
     return (x1, y1), (x2, y2)
 
 
-def _texture_score(crop: np.ndarray) -> float:
-    if crop is None or crop.size == 0:
+def _line_score(gray: np.ndarray, x1: int, y1: int, x2: int, y2: int) -> float:
+    crop = gray[y1:y2, x1:x2]
+    if crop.size == 0:
         return 0.0
-    bgr = crop[:, :, :3]
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    # The panel border/separators are pale gray, white or light blue.
+    return float(np.mean(crop >= 145))
+
+
+def _canvas_score(frame: np.ndarray, bounds: Bounds) -> float:
+    (x1, y1), (x2, y2) = bounds
+    crop = frame[y1:y2, x1:x2, :3]
+    if crop.size == 0:
+        return 0.0
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    dark_fraction = float(np.mean(hsv[:, :, 2] < 150))
     edges = cv2.Canny(gray, 35, 120)
     edge_density = float(np.count_nonzero(edges)) / float(edges.size)
-    saturation = float(np.mean(hsv[:, :, 1])) / 255.0
-    brightness = float(np.mean(hsv[:, :, 2])) / 255.0
-    edge_score = min(1.0, edge_density / 0.18)
-    saturation_score = min(1.0, saturation / 0.48)
-    brightness_score = 1.0 - min(1.0, abs(brightness - 0.50) / 0.50)
-    return 0.56 * edge_score + 0.28 * saturation_score + 0.16 * brightness_score
+    # A real minimap canvas has a dark blue/gray background plus map-detail edges.
+    return min(1.0, 0.72 * dark_fraction + 0.28 * min(1.0, edge_density / 0.12))
 
 
 def _locate_minimap(frame: np.ndarray) -> Optional[Tuple[UiRegion, UiRegion]]:
-    """Locate the upper-left minimap panel and its map canvas.
+    """Locate the complete panel first, then derive its inner map canvas.
 
-    The search is deliberately bounded to the upper-left portion of the game frame.
-    Nearby normalized layouts are scored, then the best safe candidate is retained.
+    Only the upper-left UI chrome is evaluated. Gameplay pixels inside or beside
+    the panel are never used as a positional anchor.
     """
     height, width = frame.shape[:2]
     if width < 800 or height < 500:
         return None
 
+    gray = cv2.cvtColor(frame[:, :, :3], cv2.COLOR_BGR2GRAY)
+    max_x = min(int(width * 0.24), 310)
+    max_y = min(int(height * 0.48), 360)
     candidates = []
-    for panel_w_ratio in (0.132, 0.142, 0.152, 0.164):
-        panel_w = int(round(width * panel_w_ratio))
-        for panel_h_ratio in (0.170, 0.185, 0.200, 0.215):
-            panel_h = int(round(height * panel_h_ratio))
-            for x in (0, 4, 8, 12):
-                for y_ratio in (0.028, 0.038, 0.048, 0.058):
-                    y = int(round(height * y_ratio))
-                    panel_bounds = _clip_bounds(frame, ((x, y), (x + panel_w, y + panel_h)))
-                    if panel_bounds is None:
+
+    # The panel begins very close to the captured client origin. Width and height
+    # vary with client scaling and with wide/square map layouts.
+    for x in range(0, min(25, max_x - 120), 2):
+        for y in range(0, min(55, max_y - 110), 3):
+            for panel_w in range(120, max_x - x + 1, 4):
+                right = x + panel_w
+                if right >= width:
+                    continue
+
+                # Panel height can change substantially between maps. Evaluate a
+                # broad range but keep the top-left anchor fixed.
+                for panel_h in range(105, max_y - y + 1, 6):
+                    bottom = y + panel_h
+                    if bottom >= height:
                         continue
 
+                    top_border = _line_score(gray, x, y, right, min(y + 4, bottom))
+                    left_border = _line_score(gray, x, y, min(x + 4, right), bottom)
+                    right_border = _line_score(gray, max(x, right - 4), y, right, bottom)
+                    bottom_border = _line_score(gray, x, max(y, bottom - 5), right, bottom)
+                    chrome = 0.25 * (top_border + left_border + right_border + bottom_border)
+                    if chrome < 0.34:
+                        continue
+
+                    # Header/name area is a fixed-height UI band. The actual map
+                    # canvas begins below it, independent of the total panel height.
+                    header_h = max(55, min(92, int(round(height * 0.105))))
+                    margin_x = max(5, int(round(panel_w * 0.035)))
                     canvas_bounds = _clip_bounds(
                         frame,
-                        (
-                            (x + max(5, int(panel_w * 0.035)), y + int(panel_h * 0.48)),
-                            (
-                                x + panel_w - max(5, int(panel_w * 0.035)),
-                                y + panel_h - max(6, int(panel_h * 0.055)),
-                            ),
-                        ),
+                        ((x + margin_x, y + header_h), (right - margin_x, bottom - 7)),
                     )
                     if canvas_bounds is None:
                         continue
-
                     (cx1, cy1), (cx2, cy2) = canvas_bounds
-                    if cx2 - cx1 < 110 or cy2 - cy1 < 38:
+                    canvas_w, canvas_h = cx2 - cx1, cy2 - cy1
+                    if canvas_w < 105 or canvas_h < 35:
                         continue
-                    score = _texture_score(frame[cy1:cy2, cx1:cx2])
-                    candidates.append((score, panel_bounds, canvas_bounds))
+                    if not 0.65 <= canvas_w / max(canvas_h, 1) <= 5.8:
+                        continue
+
+                    canvas = _canvas_score(frame, canvas_bounds)
+                    # Prefer the smallest panel that cleanly encloses strong chrome
+                    # and a plausible dark canvas. This prevents extending into the
+                    # gameplay scene when a character or monster passes nearby.
+                    compactness = 1.0 - min(1.0, (panel_w * panel_h) / float(max_x * max_y))
+                    score = 0.58 * chrome + 0.34 * canvas + 0.08 * compactness
+                    candidates.append((score, ((x, y), (right, bottom)), canvas_bounds))
 
     if not candidates:
         return None
 
     score, panel_bounds, canvas_bounds = max(candidates, key=lambda item: item[0])
-    if score < 0.46:
+    if score < 0.48:
         return None
 
+    method = "classic-panel-chrome-v4"
     return (
-        UiRegion("minimap_panel", panel_bounds, float(score), "classic-geometry-v3"),
-        UiRegion("minimap_canvas", canvas_bounds, float(score), "classic-geometry-v3"),
+        UiRegion("minimap_panel", panel_bounds, float(score), method),
+        UiRegion("minimap_canvas", canvas_bounds, float(score), method),
     )
 
 
@@ -146,9 +176,6 @@ def locate_fixed_ui(frame: np.ndarray) -> Optional[FixedUiSnapshot]:
     minimap_panel, minimap_canvas = located
 
     height, width = frame.shape[:2]
-
-    # The classic client keeps HP/MP/EXP and hotkeys in the bottom band. This broad
-    # crop is intentionally conservative; individual bar readers can refine it.
     status_bounds = _clip_bounds(
         frame,
         ((int(width * 0.16), int(height * 0.855)), (int(width * 0.86), height)),
