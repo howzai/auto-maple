@@ -31,13 +31,23 @@ internal sealed class GraphicsCaptureService : IDisposable
         _item = CaptureInterop.CreateItemForWindow(hwnd);
         _size = _item.Size;
 
+        FeatureLevel[] featureLevels =
+        {
+            FeatureLevel.Level_11_1,
+            FeatureLevel.Level_11_0,
+            FeatureLevel.Level_10_1,
+            FeatureLevel.Level_10_0
+        };
+
+        ID3D11Device? device;
+        ID3D11DeviceContext? context;
         D3D11CreateDevice(
-            null,
-            DriverType.Hardware,
-            DeviceCreationFlags.BgraSupport,
-            null,
-            out var device,
-            out var context).CheckError();
+            adapter: null,
+            driverType: DriverType.Hardware,
+            flags: DeviceCreationFlags.BgraSupport,
+            featureLevels: featureLevels,
+            device: out device,
+            immediateContext: out context).CheckError();
 
         _device = device ?? throw new InvalidOperationException("D3D11CreateDevice returned no device.");
         _context = context ?? throw new InvalidOperationException("D3D11CreateDevice returned no immediate context.");
@@ -209,21 +219,31 @@ internal sealed class GraphicsCaptureService : IDisposable
 internal static class CaptureInterop
 {
     private static readonly Guid GraphicsCaptureItemGuid = typeof(GraphicsCaptureItem).GUID;
+    private static readonly Guid GraphicsCaptureItemInteropGuid = typeof(IGraphicsCaptureItemInterop).GUID;
     private static readonly Guid D3D11Texture2DGuid = typeof(ID3D11Texture2D).GUID;
 
     public static GraphicsCaptureItem CreateItemForWindow(IntPtr hwnd)
     {
-        var factory = WinRT.ActivationFactory.Get("Windows.Graphics.Capture.GraphicsCaptureItem");
-        var interop = factory.As<IGraphicsCaptureItemInterop>();
-        var itemGuid = GraphicsCaptureItemGuid;
-        interop.CreateForWindow(hwnd, ref itemGuid, out var result).ThrowOnFailure();
+        using var factory = WinRT.ActivationFactory.Get("Windows.Graphics.Capture.GraphicsCaptureItem");
+        var interopGuid = GraphicsCaptureItemInteropGuid;
+        Marshal.QueryInterface(factory.ThisPtr, ref interopGuid, out var interopPointer).ThrowOnFailure();
         try
         {
-            return WinRT.MarshalInterface<GraphicsCaptureItem>.FromAbi(result);
+            var interop = (IGraphicsCaptureItemInterop)Marshal.GetObjectForIUnknown(interopPointer);
+            var itemGuid = GraphicsCaptureItemGuid;
+            interop.CreateForWindow(hwnd, ref itemGuid, out var result).ThrowOnFailure();
+            try
+            {
+                return WinRT.MarshalInterface<GraphicsCaptureItem>.FromAbi(result);
+            }
+            finally
+            {
+                Marshal.Release(result);
+            }
         }
         finally
         {
-            Marshal.Release(result);
+            Marshal.Release(interopPointer);
         }
     }
 
