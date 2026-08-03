@@ -1,15 +1,21 @@
-"""Display frames published by MapleCaptureHost --test-pattern.
+"""Display frames published by MapleCaptureHost.
 
-Run the host first:
-    dotnet run --project capture_host -- --test-pattern
-Then run this script from the project root:
+Run this script from any working directory:
     python tools/test_wgc_reader.py
-Press Esc to close.
+
+The project root is added to sys.path automatically so the src package can always
+be imported. Press Esc to close the preview window.
 """
 
 from __future__ import annotations
 
+import sys
 import time
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import cv2
 
