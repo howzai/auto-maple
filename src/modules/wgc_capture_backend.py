@@ -21,6 +21,8 @@ from src.modules.windows_graphics_capture import WindowsGraphicsCaptureReader
 
 HOST_START_TIMEOUT = 8.0
 HOST_RESTART_DELAY = 2.0
+FRAME_WAIT_SECONDS = 0.075
+FRAME_POLL_SECONDS = 0.002
 
 
 def _project_root() -> Path:
@@ -162,7 +164,13 @@ def install_wgc_capture(capture_class) -> None:
                 time.sleep(min(delay, 0.25))
             return None
 
-        frame = reader.read_latest()
+        deadline = time.monotonic() + FRAME_WAIT_SECONDS
+        frame = None
+        while frame is None and time.monotonic() < deadline:
+            frame = reader.read_latest()
+            if frame is None:
+                time.sleep(FRAME_POLL_SECONDS)
+
         if frame is None:
             self.capture_backend = "Windows Graphics Capture: waiting for frame"
             self.last_error = reader.last_error or "Waiting for Windows Graphics Capture frame"
