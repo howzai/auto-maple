@@ -218,32 +218,48 @@ internal sealed class GraphicsCaptureService : IDisposable
 
 internal static class CaptureInterop
 {
+    private const string GraphicsCaptureItemRuntimeClass = "Windows.Graphics.Capture.GraphicsCaptureItem";
+
     private static readonly Guid GraphicsCaptureItemGuid = typeof(GraphicsCaptureItem).GUID;
-    private static readonly Guid GraphicsCaptureItemInteropGuid = typeof(IGraphicsCaptureItemInterop).GUID;
+    private static readonly Guid GraphicsCaptureItemInteropGuid = new("3628E81B-3CAC-4C60-B7F4-23CE0E0C3356");
     private static readonly Guid D3D11Texture2DGuid = typeof(ID3D11Texture2D).GUID;
 
     public static GraphicsCaptureItem CreateItemForWindow(IntPtr hwnd)
     {
-        using var factory = WinRT.ActivationFactory.Get("Windows.Graphics.Capture.GraphicsCaptureItem");
-        var interopGuid = GraphicsCaptureItemInteropGuid;
-        Marshal.QueryInterface(factory.ThisPtr, ref interopGuid, out var interopPointer).ThrowOnFailure();
+        IntPtr className = IntPtr.Zero;
+        IntPtr interopPointer = IntPtr.Zero;
+        IntPtr itemPointer = IntPtr.Zero;
+
+        WindowsCreateString(
+            GraphicsCaptureItemRuntimeClass,
+            (uint)GraphicsCaptureItemRuntimeClass.Length,
+            out className).ThrowOnFailure();
+
         try
         {
+            var interopGuid = GraphicsCaptureItemInteropGuid;
+            RoGetActivationFactory(className, ref interopGuid, out interopPointer).ThrowOnFailure();
+
             var interop = (IGraphicsCaptureItemInterop)Marshal.GetObjectForIUnknown(interopPointer);
             var itemGuid = GraphicsCaptureItemGuid;
-            interop.CreateForWindow(hwnd, ref itemGuid, out var result).ThrowOnFailure();
-            try
-            {
-                return WinRT.MarshalInterface<GraphicsCaptureItem>.FromAbi(result);
-            }
-            finally
-            {
-                Marshal.Release(result);
-            }
+            interop.CreateForWindow(hwnd, ref itemGuid, out itemPointer).ThrowOnFailure();
+
+            return WinRT.MarshalInterface<GraphicsCaptureItem>.FromAbi(itemPointer);
         }
         finally
         {
-            Marshal.Release(interopPointer);
+            if (itemPointer != IntPtr.Zero)
+            {
+                Marshal.Release(itemPointer);
+            }
+            if (interopPointer != IntPtr.Zero)
+            {
+                Marshal.Release(interopPointer);
+            }
+            if (className != IntPtr.Zero)
+            {
+                WindowsDeleteString(className);
+            }
         }
     }
 
@@ -269,6 +285,21 @@ internal static class CaptureInterop
         access.GetInterface(ref textureGuid, out var pointer).ThrowOnFailure();
         return new ID3D11Texture2D(pointer);
     }
+
+    [DllImport("combase.dll", CharSet = CharSet.Unicode)]
+    private static extern int WindowsCreateString(
+        string sourceString,
+        uint length,
+        out IntPtr hstring);
+
+    [DllImport("combase.dll")]
+    private static extern int WindowsDeleteString(IntPtr hstring);
+
+    [DllImport("combase.dll")]
+    private static extern int RoGetActivationFactory(
+        IntPtr activatableClassId,
+        ref Guid iid,
+        out IntPtr factory);
 
     [DllImport("d3d11.dll")]
     private static extern int CreateDirect3D11DeviceFromDXGIDevice(
