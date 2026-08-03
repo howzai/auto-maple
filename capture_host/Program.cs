@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -5,11 +6,24 @@ namespace MapleCaptureHost;
 
 internal static class Program
 {
-    private static readonly string[] TitleKeywords =
+    private const string ExactClassicTitle = "新楓之谷：經典版";
+
+    private static readonly string[] AllowedProcessNames =
     {
-        "新楓之谷：經典版",
-        "新楓之谷",
-        "MapleStory"
+        "Maplestory_Classic",
+        "MapleStory",
+        "MapleStoryClassic"
+    };
+
+    private static readonly string[] RejectedProcessNames =
+    {
+        "chrome",
+        "msedge",
+        "firefox",
+        "opera",
+        "brave",
+        "iexplore",
+        "ApplicationFrameHost"
     };
 
     [STAThread]
@@ -54,7 +68,11 @@ internal static class Program
             return 3;
         }
 
-        Console.WriteLine($"Target window found: '{window.Title}' HWND=0x{window.Handle.ToInt64():X}");
+        Console.WriteLine(
+            $"Target window found: '{window.Title}' " +
+            $"process={window.ProcessName} size={window.Width}x{window.Height} " +
+            $"HWND=0x{window.Handle.ToInt64():X}"
+        );
         Console.WriteLine("Starting Windows Graphics Capture. Press Ctrl+C to stop.");
 
         try
@@ -79,9 +97,10 @@ internal static class Program
     private static WindowMatch FindTargetWindow()
     {
         var matches = new List<WindowMatch>();
+
         EnumWindows((handle, _) =>
         {
-            if (!IsWindowVisible(handle))
+            if (!IsWindowVisible(handle) || IsIconic(handle))
             {
                 return true;
             }
@@ -95,27 +114,91 @@ internal static class Program
             var builder = new StringBuilder(length + 1);
             _ = GetWindowTextW(handle, builder, builder.Capacity);
             var title = builder.ToString().Trim();
-            if (TitleKeywords.Any(keyword => title.Contains(keyword, StringComparison.OrdinalIgnoreCase)))
+            if (string.IsNullOrWhiteSpace(title))
             {
-                matches.Add(new WindowMatch(handle, title, GetWindowArea(handle)));
+                return true;
             }
 
+            var processName = GetProcessName(handle);
+            if (RejectedProcessNames.Any(name =>
+                    processName.Equals(name, StringComparison.OrdinalIgnoreCase)))
+            {
+                return true;
+            }
+
+            if (!GetWindowRect(handle, out var rect))
+            {
+                return true;
+            }
+
+            var width = Math.Max(0, rect.Right - rect.Left);
+            var height = Math.Max(0, rect.Bottom - rect.Top);
+
+            // Reject splash windows, launchers, thumbnails and transitional windows.
+            if (width < 800 || height < 500)
+            {
+                return true;
+            }
+
+            var exactTitle = title.Equals(ExactClassicTitle, StringComparison.OrdinalIgnoreCase);
+            var mapleProcess = AllowedProcessNames.Any(name =>
+                processName.Equals(name, StringComparison.OrdinalIgnoreCase));
+
+            // A valid target must either have the exact game title or be a known
+            // MapleStory executable whose title starts with the game name.
+            if (!exactTitle && !(mapleProcess && title.StartsWith("新楓之谷", StringComparison.OrdinalIgnoreCase)))
+            {
+                return true;
+            }
+
+            var score = 0;
+            if (exactTitle)
+            {
+                score += 1000;
+            }
+            if (mapleProcess)
+            {
+                score += 2000;
+            }
+            score += Math.Min(width * height / 1000, 1500);
+
+            matches.Add(new WindowMatch(handle, title, processName, width, height, score));
             return true;
         }, IntPtr.Zero);
 
         return matches
-            .OrderByDescending(match => match.Area)
+            .OrderByDescending(match => match.Score)
+            .ThenByDescending(match => match.Width * (long)match.Height)
             .FirstOrDefault();
     }
 
-    private static long GetWindowArea(IntPtr handle)
+    private static string GetProcessName(IntPtr handle)
     {
-        return GetWindowRect(handle, out var rect)
-            ? Math.Max(0, rect.Right - rect.Left) * (long)Math.Max(0, rect.Bottom - rect.Top)
-            : 0;
+        _ = GetWindowThreadProcessId(handle, out var processId);
+        if (processId == 0)
+        {
+            return string.Empty;
+        }
+
+        try
+        {
+            using var process = Process.GetProcessById((int)processId);
+            return process.ProcessName;
+        }
+        catch
+        {
+            return string.Empty;
+        }
     }
 
-    private readonly record struct WindowMatch(IntPtr Handle, string Title, long Area);
+    private readonly record struct WindowMatch(
+        IntPtr Handle,
+        string Title,
+        string ProcessName,
+        int Width,
+        int Height,
+        int Score
+    );
 
     private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
 
@@ -127,6 +210,10 @@ internal static class Program
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool IsWindowVisible(IntPtr hWnd);
 
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool IsIconic(IntPtr hWnd);
+
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     private static extern int GetWindowTextLengthW(IntPtr hWnd);
 
@@ -136,6 +223,9 @@ internal static class Program
     [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool GetWindowRect(IntPtr hWnd, out Rect rect);
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
 
     [StructLayout(LayoutKind.Sequential)]
     private struct Rect
