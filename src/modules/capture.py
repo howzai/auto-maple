@@ -1,10 +1,8 @@
-"""Screen capture, minimap calibration, and player-position tracking.
+"""Windows Graphics Capture, minimap calibration, and player tracking.
 
-The capture service fails safe. When the game window disappears, is minimized, the
-capture stream stalls, or the minimap/player cannot be located reliably, automation
-is paused and all held keys are released.
+Frames are read exclusively from MapleCaptureHost shared memory. There is no
+screen-capture fallback: when WGC stops, Auto Maple pauses and releases keys.
 """
-
 from __future__ import annotations
 
 import ctypes
@@ -13,18 +11,16 @@ import sys
 import threading
 import time
 import traceback
+from ctypes import wintypes
 from pathlib import Path
 from typing import Dict, Optional, Sequence, Tuple
 
 import cv2
-import mss
-import mss.windows
 import numpy as np
-from ctypes import wintypes
 
 from src.common import config, utils
 from src.common.vkeys import release_all
-
+from src.modules.windows_graphics_capture import WindowsGraphicsCaptureReader
 
 user32 = ctypes.windll.user32
 try:
@@ -32,8 +28,6 @@ try:
 except Exception:
     pass
 
-# Exact titles are checked first. A conservative partial-title fallback is then
-# used for regional clients whose title contains MapleStory / 楓之谷.
 GAME_WINDOW_TITLES = (
     "MapleStory",
     "新楓之谷",
@@ -45,6 +39,8 @@ GAME_WINDOW_TITLE_KEYWORDS = ("maplestory", "楓之谷")
 TARGET_FPS = 30
 FRAME_INTERVAL = 1.0 / TARGET_FPS
 WINDOW_RETRY_DELAY = 1.0
+FRAME_RETRY_DELAY = 0.01
+FRAME_WAIT_TIMEOUT = 0.35
 CALIBRATION_RETRY_DELAY = 0.5
 MINIMAP_MATCH_THRESHOLD = 0.72
 PLAYER_MATCH_THRESHOLD = 0.80
@@ -52,7 +48,6 @@ PLAYER_LOST_TIMEOUT = 1.5
 CAPTURE_STALL_TIMEOUT = 2.5
 WATCHDOG_INTERVAL = 0.25
 
-# Player tracking parameters. Coordinates are normalized minimap coordinates.
 POSITION_EMA_ALPHA = 0.45
 MAX_NORMAL_JUMP = 0.18
 TELEPORT_CONFIRM_FRAMES = 3
@@ -65,7 +60,6 @@ Point = Tuple[float, float]
 
 
 def _project_root() -> Path:
-    """Return a stable project root in source and PyInstaller environments."""
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
         return Path(sys._MEIPASS)
     return Path(__file__).resolve().parents[2]
@@ -89,7 +83,6 @@ def _window_title(handle: int) -> str:
 
 
 def _find_game_window() -> Tuple[int, str]:
-    """Find a visible MapleStory client window across regional title variants."""
     for title in GAME_WINDOW_TITLES:
         handle = user32.FindWindowW(None, title)
         if handle and user32.IsWindow(handle):
@@ -112,8 +105,6 @@ def _find_game_window() -> Tuple[int, str]:
     if not matches:
         return 0, ""
 
-    # Prefer the largest matching visible window, which avoids launchers or tiny
-    # helper windows that may also contain MapleStory in their title.
     def area(item):
         rect = wintypes.RECT()
         if not user32.GetWindowRect(item[0], ctypes.pointer(rect)):
@@ -137,16 +128,15 @@ def _distance(a: Point, b: Point) -> float:
 
 
 class Capture:
-    """Continuously capture the game and publish safe minimap state."""
+    """Continuously read WGC frames and publish safe minimap state."""
 
     def __init__(self):
         config.capture = self
-
         self.frame: Optional[np.ndarray] = None
         self.minimap: Dict[str, object] = {}
         self.minimap_ratio = 1.0
         self.minimap_sample: Optional[np.ndarray] = None
-        self.sct: Optional[mss.mss] = None
+        self.reader = WindowsGraphicsCaptureReader()
         self.window = {"left": 0, "top": 0, "width": 1366, "height": 768}
         self.window_title = ""
 
@@ -169,32 +159,24 @@ class Capture:
         self._minimap_br = (0, 0)
         self._state_lock = threading.RLock()
         self._stop_event = threading.Event()
-        self.thread = threading.Thread(
-            target=self._main,
-            name="auto-maple-capture",
-            daemon=True,
-        )
+        self.thread = threading.Thread(target=self._main, name="auto-maple-capture", daemon=True)
         self.watchdog_thread = threading.Thread(
-            target=self._watchdog,
-            name="auto-maple-capture-watchdog",
-            daemon=True,
+            target=self._watchdog, name="auto-maple-capture-watchdog", daemon=True
         )
 
     def start(self):
-        print("\n[~] Started video capture")
+        print("\n[~] Started Windows Graphics Capture reader")
         self.thread.start()
         self.watchdog_thread.start()
 
     def stop(self):
         self._stop_event.set()
+        self.reader.close()
         self._pause_for_safety("Capture stopped")
 
     def health_snapshot(self) -> Dict[str, object]:
-        """Return an immutable diagnostic snapshot for GUI/logging code."""
         with self._state_lock:
-            age = None
-            if self.last_frame_time:
-                age = max(0.0, time.monotonic() - self.last_frame_time)
+            age = None if not self.last_frame_time else max(0.0, time.monotonic() - self.last_frame_time)
             return {
                 "ready": self.ready,
                 "thread_alive": self.thread.is_alive(),
@@ -211,59 +193,52 @@ class Capture:
             }
 
     def _main(self):
-        """Wait for the window, calibrate, then track at a bounded frame rate."""
-        mss.windows.CAPTUREBLT = 0
         self.ready = True
-
         try:
-            with mss.mss() as sct:
-                self.sct = sct
-                while not self._stop_event.is_set():
-                    if not self._refresh_window():
-                        self._pause_for_safety("Waiting for game window")
-                        time.sleep(WINDOW_RETRY_DELAY)
+            while not self._stop_event.is_set():
+                if not self._refresh_window():
+                    self._pause_for_safety("Waiting for game window")
+                    time.sleep(WINDOW_RETRY_DELAY)
+                    continue
+
+                if not self.calibrated:
+                    if not self._calibrate_minimap():
+                        time.sleep(CALIBRATION_RETRY_DELAY)
                         continue
 
-                    if not self.calibrated:
-                        if not self._calibrate_minimap():
-                            time.sleep(CALIBRATION_RETRY_DELAY)
-                            continue
+                started = time.perf_counter()
+                if not self._capture_and_track():
+                    if self.reader.last_error:
+                        self.last_error = self.reader.last_error
+                    time.sleep(FRAME_RETRY_DELAY)
 
-                    started = time.perf_counter()
-                    if not self._capture_and_track():
-                        self.calibrated = False
-
-                    remaining = FRAME_INTERVAL - (time.perf_counter() - started)
-                    if remaining > 0:
-                        time.sleep(remaining)
+                remaining = FRAME_INTERVAL - (time.perf_counter() - started)
+                if remaining > 0:
+                    time.sleep(remaining)
         except Exception as exc:
             self.last_error = f"{type(exc).__name__}: {exc}"
             self._pause_for_safety("Capture thread crashed")
             print("\n[!] Capture thread stopped unexpectedly:")
             traceback.print_exc()
         finally:
-            self.sct = None
+            self.reader.close()
             self.window_found = False
             self.calibrated = False
 
     def _watchdog(self):
-        """Pause automation when the capture worker dies or stops producing frames."""
         while not self._stop_event.is_set():
             time.sleep(WATCHDOG_INTERVAL)
             if not self.ready:
                 continue
-
             if not self.thread.is_alive():
                 self.last_error = self.last_error or "Capture worker is not running"
                 self._pause_for_safety("Capture worker stopped")
                 return
-
             if not self.window_found or not self.calibrated or not self.last_frame_time:
                 continue
-
             frame_age = time.monotonic() - self.last_frame_time
             if frame_age > CAPTURE_STALL_TIMEOUT:
-                self.last_error = f"Capture stalled for {frame_age:.2f} seconds"
+                self.last_error = f"Windows Graphics Capture stalled for {frame_age:.2f} seconds"
                 self.calibrated = False
                 self._pause_for_safety("Capture stream stalled")
 
@@ -289,48 +264,31 @@ class Capture:
         rect = wintypes.RECT()
         if not user32.GetWindowRect(handle, ctypes.pointer(rect)):
             self.window_found = False
-            self.calibrated = False
-            self._reset_tracking()
             return False
-
         width = rect.right - rect.left
         height = rect.bottom - rect.top
         if width < MMT_WIDTH or height < MMT_HEIGHT:
             self.last_error = f"Matched game window is too small: {width}x{height}"
             self.window_found = False
-            self.calibrated = False
-            self._reset_tracking()
             return False
 
-        new_window = {
-            "left": max(0, rect.left),
-            "top": max(0, rect.top),
-            "width": width,
-            "height": height,
-        }
-
-        changed = handle != self._handle or new_window != self.window
         newly_found = handle != self._handle
-        if self._handle and changed:
-            self.calibrated = False
-            self._reset_tracking()
-
         self._handle = handle
         self.window_title = title
-        self.window = new_window
         self.window_found = True
         if newly_found:
+            self.calibrated = False
+            self._reset_tracking()
             self.last_error = None
-            print(f"\n[~] Game window found: '{title}' ({width}x{height})")
+            print(f"\n[~] Game window found: '{title}'")
         return True
 
     @staticmethod
     def _best_match(frame: np.ndarray, template: np.ndarray):
-        if frame is None or frame.size == 0:
+        if frame is None or frame.size == 0 or frame.ndim != 3:
             return None
         if template.shape[0] > frame.shape[0] or template.shape[1] > frame.shape[1]:
             return None
-
         conversion = cv2.COLOR_BGRA2GRAY if frame.shape[2] == 4 else cv2.COLOR_BGR2GRAY
         gray = cv2.cvtColor(frame, conversion)
         result = cv2.matchTemplate(gray, template, cv2.TM_CCOEFF_NORMED)
@@ -339,15 +297,16 @@ class Capture:
         return float(score), top_left, (top_left[0] + w, top_left[1] + h)
 
     def _calibrate_minimap(self) -> bool:
-        frame = self.screenshot(delay=0)
+        frame = self.screenshot(delay=0.1)
         if frame is None:
+            self.last_error = self.reader.last_error or "Waiting for Windows Graphics Capture frame"
             return False
 
         tl_match = self._best_match(frame, MM_TL_TEMPLATE)
         br_match = self._best_match(frame, MM_BR_TEMPLATE)
         if not tl_match or not br_match:
+            self.last_error = "Unable to search minimap templates in WGC frame"
             return False
-
         tl_score, tl, _ = tl_match
         br_score, _, br = br_match
         if tl_score < MINIMAP_MATCH_THRESHOLD or br_score < MINIMAP_MATCH_THRESHOLD:
@@ -362,13 +321,10 @@ class Capture:
             max(mm_tl[0] + PT_WIDTH, br[0] - MINIMAP_BOTTOM_BORDER),
             max(mm_tl[1] + PT_HEIGHT, br[1] - MINIMAP_BOTTOM_BORDER),
         )
-
         if mm_br[0] > frame.shape[1] or mm_br[1] > frame.shape[0]:
-            self.last_error = "Detected minimap bounds exceed captured frame"
+            self.last_error = "Detected minimap bounds exceed WGC frame"
             return False
-
-        width = mm_br[0] - mm_tl[0]
-        height = mm_br[1] - mm_tl[1]
+        width, height = mm_br[0] - mm_tl[0], mm_br[1] - mm_tl[1]
         if width <= 0 or height <= 0:
             self.last_error = "Detected minimap has invalid dimensions"
             return False
@@ -376,41 +332,31 @@ class Capture:
         sample = frame[mm_tl[1]:mm_br[1], mm_tl[0]:mm_br[0]]
         if sample.size == 0:
             return False
-
         with self._state_lock:
             self._minimap_tl = mm_tl
             self._minimap_br = mm_br
             self.minimap_ratio = width / height
             self.minimap_sample = sample.copy()
             self.frame = frame
+            self.window["width"] = frame.shape[1]
+            self.window["height"] = frame.shape[0]
             self.calibrated = True
             self.last_error = None
             self._reset_tracking()
-
-        print(
-            f"\n[~] Minimap calibrated "
-            f"(confidence {min(tl_score, br_score):.2f}, {width}x{height})"
-        )
+        print(f"\n[~] Minimap calibrated from WGC (confidence {min(tl_score, br_score):.2f}, {width}x{height})")
         return True
 
     def _player_candidates(self, minimap: np.ndarray) -> Sequence[Tuple[Point, float]]:
-        """Return normalized player candidates with template confidence scores."""
         conversion = cv2.COLOR_BGRA2GRAY if minimap.shape[2] == 4 else cv2.COLOR_BGR2GRAY
         gray = cv2.cvtColor(minimap, conversion)
         if PLAYER_TEMPLATE.shape[0] > gray.shape[0] or PLAYER_TEMPLATE.shape[1] > gray.shape[1]:
             return []
-
         result = cv2.matchTemplate(gray, PLAYER_TEMPLATE, cv2.TM_CCOEFF_NORMED)
         ys, xs = np.where(result >= PLAYER_MATCH_THRESHOLD)
         candidates = []
         for x, y in zip(xs, ys):
-            center = (
-                int(round(x + PLAYER_TEMPLATE.shape[1] / 2)),
-                int(round(y + PLAYER_TEMPLATE.shape[0] / 2)),
-            )
-            relative = utils.convert_to_relative(center, minimap)
-            candidates.append((relative, float(result[y, x])))
-
+            center = (int(round(x + PLAYER_TEMPLATE.shape[1] / 2)), int(round(y + PLAYER_TEMPLATE.shape[0] / 2)))
+            candidates.append((utils.convert_to_relative(center, minimap), float(result[y, x])))
         candidates.sort(key=lambda item: item[1], reverse=True)
         deduplicated = []
         for point, score in candidates:
@@ -418,54 +364,39 @@ class Capture:
                 deduplicated.append((point, score))
         return deduplicated
 
-    def _select_player_candidate(
-        self, candidates: Sequence[Tuple[Point, float]]
-    ) -> Optional[Tuple[Point, float]]:
+    def _select_player_candidate(self, candidates):
         if not candidates:
             return None
         if self._filtered_position is None:
             return max(candidates, key=lambda item: item[1])
-
-        return min(
-            candidates,
-            key=lambda item: _distance(item[0], self._filtered_position) - item[1] * 0.02,
-        )
+        return min(candidates, key=lambda item: _distance(item[0], self._filtered_position) - item[1] * 0.02)
 
     def _accept_position(self, position: Point) -> Optional[Point]:
-        """Smooth normal motion and require confirmation for large coordinate jumps."""
         if self._filtered_position is None:
             self._filtered_position = position
             return position
-
         jump = _distance(position, self._filtered_position)
         if jump <= MAX_NORMAL_JUMP:
             self._pending_jump = None
             self._pending_jump_frames = 0
             alpha = POSITION_EMA_ALPHA
-            filtered = (
+            self._filtered_position = (
                 alpha * position[0] + (1.0 - alpha) * self._filtered_position[0],
                 alpha * position[1] + (1.0 - alpha) * self._filtered_position[1],
             )
-            self._filtered_position = filtered
-            return filtered
-
+            return self._filtered_position
         if self._pending_jump is None or _distance(position, self._pending_jump) > TELEPORT_CLUSTER_RADIUS:
             self._pending_jump = position
             self._pending_jump_frames = 1
         else:
-            self._pending_jump = (
-                (self._pending_jump[0] + position[0]) / 2,
-                (self._pending_jump[1] + position[1]) / 2,
-            )
+            self._pending_jump = ((self._pending_jump[0] + position[0]) / 2, (self._pending_jump[1] + position[1]) / 2)
             self._pending_jump_frames += 1
-
         if self._pending_jump_frames >= TELEPORT_CONFIRM_FRAMES:
             self._filtered_position = self._pending_jump
             accepted = self._filtered_position
             self._pending_jump = None
             self._pending_jump_frames = 0
             return accepted
-
         self.rejected_player_jumps += 1
         return None
 
@@ -473,16 +404,15 @@ class Capture:
         if not self._refresh_window():
             self._pause_for_safety("Game window lost")
             return False
-
         frame = self.screenshot(delay=0)
         if frame is None:
             return False
-
         x1, y1 = self._minimap_tl
         x2, y2 = self._minimap_br
         if y2 > frame.shape[0] or x2 > frame.shape[1]:
+            self.last_error = "WGC frame size changed; recalibrating minimap"
+            self.calibrated = False
             return False
-
         minimap = frame[y1:y2, x1:x2]
         if minimap.size == 0:
             return False
@@ -491,12 +421,10 @@ class Capture:
         candidates = self._player_candidates(minimap)
         selected = self._select_player_candidate(candidates)
         accepted_position = None
-
         if selected is not None:
             raw_position, confidence = selected
             accepted_position = self._accept_position(raw_position)
             self.player_confidence = confidence
-
         if accepted_position is not None:
             config.player_pos = accepted_position
             self.last_player_seen = now
@@ -506,7 +434,6 @@ class Capture:
         else:
             self.player_found = False
             self.player_confidence = 0.0
-
         if not self.player_found and self.last_player_seen and now - self.last_player_seen > PLAYER_LOST_TIMEOUT:
             self._pause_for_safety("Player marker lost")
 
@@ -514,6 +441,7 @@ class Capture:
             self.frame = frame
             self.frame_id += 1
             self.last_frame_time = now
+            self.last_error = None
             self.minimap = {
                 "minimap": minimap.copy(),
                 "rune_active": bool(getattr(config.bot, "rune_active", False)),
@@ -539,13 +467,15 @@ class Capture:
             print(f"\n[!] Auto Maple paused for safety: {reason}")
 
     def screenshot(self, delay: float = 1.0) -> Optional[np.ndarray]:
-        if self.sct is None or not self.window_found:
+        if not self.window_found:
             return None
-        try:
-            return np.asarray(self.sct.grab(self.window))
-        except (mss.exception.ScreenShotError, ValueError) as exc:
-            self.last_error = f"Screenshot failed: {exc}"
-            if delay:
-                print(f"\n[!] Error while taking screenshot; retrying in {delay:g} second(s)")
-                time.sleep(delay)
-            return None
+        deadline = time.monotonic() + max(FRAME_WAIT_TIMEOUT, delay)
+        while not self._stop_event.is_set():
+            frame = self.reader.read_latest()
+            if frame is not None:
+                return frame
+            if time.monotonic() >= deadline:
+                self.last_error = self.reader.last_error or "Waiting for Windows Graphics Capture frame"
+                return None
+            time.sleep(FRAME_RETRY_DELAY)
+        return None
