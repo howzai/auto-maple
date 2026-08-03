@@ -281,7 +281,7 @@ internal static class CaptureInterop
 
     public static ID3D11Texture2D GetTexture(IDirect3DSurface surface)
     {
-        using var access = surface.As<IDirect3DDxgiInterfaceAccess>();
+        var access = surface.As<IDirect3DDxgiInterfaceAccess>();
         var textureGuid = D3D11Texture2DGuid;
         var pointer = access.GetInterface(in textureGuid);
         if (pointer == IntPtr.Zero)
