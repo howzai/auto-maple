@@ -4,6 +4,7 @@ using Windows.Graphics;
 using Windows.Graphics.Capture;
 using Windows.Graphics.DirectX;
 using Windows.Graphics.DirectX.Direct3D11;
+using Vortice.Direct3D;
 using Vortice.Direct3D11;
 using Vortice.DXGI;
 using static Vortice.Direct3D11.D3D11;
@@ -35,9 +36,11 @@ internal sealed class GraphicsCaptureService : IDisposable
             DriverType.Hardware,
             DeviceCreationFlags.BgraSupport,
             null,
-            out _device,
-            out _context).CheckError();
+            out var device,
+            out var context).CheckError();
 
+        _device = device ?? throw new InvalidOperationException("D3D11CreateDevice returned no device.");
+        _context = context ?? throw new InvalidOperationException("D3D11CreateDevice returned no immediate context.");
         _winRtDevice = CaptureInterop.CreateWinRtDevice(_device);
     }
 
@@ -98,7 +101,11 @@ internal sealed class GraphicsCaptureService : IDisposable
             EnsureStaging(contentSize.Width, contentSize.Height);
             _context.CopyResource(_staging!, source);
 
-            var mapped = _context.Map(_staging!, 0, MapMode.Read, MapFlags.None);
+            var mapped = _context.Map(
+                _staging!,
+                0,
+                MapMode.Read,
+                Vortice.Direct3D11.MapFlags.None);
             try
             {
                 var rowBytes = checked(contentSize.Width * 4);
@@ -146,7 +153,7 @@ internal sealed class GraphicsCaptureService : IDisposable
         if (_staging is not null)
         {
             var description = _staging.Description;
-            if (description.Width == width && description.Height == height)
+            if (description.Width == (uint)width && description.Height == (uint)height)
             {
                 return;
             }
@@ -160,8 +167,8 @@ internal sealed class GraphicsCaptureService : IDisposable
         _staging?.Dispose();
         _staging = _device.CreateTexture2D(new Texture2DDescription
         {
-            Width = width,
-            Height = height,
+            Width = checked((uint)width),
+            Height = checked((uint)height),
             MipLevels = 1,
             ArraySize = 1,
             Format = Format.B8G8R8A8_UNorm,
@@ -206,10 +213,18 @@ internal static class CaptureInterop
 
     public static GraphicsCaptureItem CreateItemForWindow(IntPtr hwnd)
     {
-        var factory = WindowsRuntimeMarshal.GetActivationFactory(typeof(GraphicsCaptureItem));
-        var interop = (IGraphicsCaptureItemInterop)factory;
-        interop.CreateForWindow(hwnd, ref GraphicsCaptureItemGuid, out var result).ThrowOnFailure();
-        return (GraphicsCaptureItem)Marshal.GetObjectForIUnknown(result);
+        var factory = WinRT.ActivationFactory.Get("Windows.Graphics.Capture.GraphicsCaptureItem");
+        var interop = factory.As<IGraphicsCaptureItemInterop>();
+        var itemGuid = GraphicsCaptureItemGuid;
+        interop.CreateForWindow(hwnd, ref itemGuid, out var result).ThrowOnFailure();
+        try
+        {
+            return WinRT.MarshalInterface<GraphicsCaptureItem>.FromAbi(result);
+        }
+        finally
+        {
+            Marshal.Release(result);
+        }
     }
 
     public static IDirect3DDevice CreateWinRtDevice(ID3D11Device device)
@@ -217,13 +232,21 @@ internal static class CaptureInterop
         using var dxgiDevice = device.QueryInterface<IDXGIDevice>();
         var hr = CreateDirect3D11DeviceFromDXGIDevice(dxgiDevice.NativePointer, out var inspectable);
         hr.ThrowOnFailure();
-        return (IDirect3DDevice)Marshal.GetObjectForIUnknown(inspectable);
+        try
+        {
+            return WinRT.MarshalInterface<IDirect3DDevice>.FromAbi(inspectable);
+        }
+        finally
+        {
+            Marshal.Release(inspectable);
+        }
     }
 
     public static ID3D11Texture2D GetTexture(IDirect3DSurface surface)
     {
         var access = (IDirect3DDxgiInterfaceAccess)surface;
-        access.GetInterface(ref D3D11Texture2DGuid, out var pointer).ThrowOnFailure();
+        var textureGuid = D3D11Texture2DGuid;
+        access.GetInterface(ref textureGuid, out var pointer).ThrowOnFailure();
         return new ID3D11Texture2D(pointer);
     }
 
