@@ -18,8 +18,10 @@ Located = Tuple[Bounds, float, str]
 _MODEL = None
 _MODEL_ATTEMPTED = False
 
-RELOCALIZE_INTERVAL_SECONDS = 0.75
-RELOCALIZE_CONFIRMATIONS = 4
+# Relocalizing the panel is expensive and does not need to run every few frames.
+# The live minimap crop is still refreshed on every captured frame.
+RELOCALIZE_INTERVAL_SECONDS = 2.0
+RELOCALIZE_CONFIRMATIONS = 3
 RELOCALIZE_CLUSTER_TOLERANCE = 8
 MAX_SINGLE_STEP_PIXELS = 28
 MAX_SIZE_CHANGE_RATIO = 0.22
@@ -159,11 +161,6 @@ def _plausible_transition(old_bounds: Bounds, new_bounds: Bounds) -> bool:
 
 
 def _publish_frame_heartbeat(self, frame: np.ndarray) -> float:
-    """Publish a fresh frame timestamp even while minimap calibration is running.
-
-    Without this heartbeat the watchdog interprets calibration as a stalled WGC
-    stream, clears ``calibrated`` again, and creates an endless recalibration loop.
-    """
     now = time.monotonic()
     with self._state_lock:
         self.frame = frame
@@ -172,6 +169,24 @@ def _publish_frame_heartbeat(self, frame: np.ndarray) -> float:
         self.window["width"] = frame.shape[1]
         self.window["height"] = frame.shape[0]
     return now
+
+
+def _publish_live_minimap(self) -> None:
+    """Refresh the GUI preview from the current frame on every capture cycle."""
+    frame = self.frame
+    if frame is None:
+        return
+    x1, y1 = self._minimap_tl
+    x2, y2 = self._minimap_br
+    if not (0 <= x1 < x2 <= frame.shape[1] and 0 <= y1 < y2 <= frame.shape[0]):
+        return
+    live = frame[y1:y2, x1:x2]
+    if live.size == 0:
+        return
+    with self._state_lock:
+        self.minimap_sample = live.copy()
+        if isinstance(getattr(self, "minimap", None), dict):
+            self.minimap["minimap"] = live.copy()
 
 
 def _apply_location(self, frame, located, ui_snapshot, reset_tracking: bool) -> bool:
@@ -220,7 +235,6 @@ def install_classic_vision_backend(capture_class) -> None:
         if frame is None:
             return False
 
-        # Keep GUI frame age and watchdog state live during every calibration try.
         _publish_frame_heartbeat(self, frame)
 
         result = locate_classic_minimap(frame)
@@ -252,6 +266,10 @@ def install_classic_vision_backend(capture_class) -> None:
         ok = original_capture_and_track(self)
         if not ok or self.frame is None:
             return ok
+
+        # The GUI previously kept showing the one-time calibration sample.
+        # Publish the newly cropped minimap every frame before any slower relocalization.
+        _publish_live_minimap(self)
 
         now = time.monotonic()
         last = getattr(self, "_classic_last_relocalize", 0.0)
