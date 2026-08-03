@@ -67,27 +67,46 @@ def _deduplicate(candidates: List[Candidate]) -> List[Candidate]:
 
 
 def install_classic_player_fallback(capture_class) -> None:
-    """Prefer the classic client's yellow self-marker over legacy templates."""
+    """Use the yellow self-marker as the authoritative, low-latency position."""
     if getattr(capture_class, "_classic_player_patch_installed", False):
         return
+
+    original_accept_position = capture_class._accept_position
 
     def bounded_player_candidates(self, minimap: np.ndarray):
         classic = detection.classic_player_candidates(minimap)
 
-        # The classic client uses a yellow diamond for the local player. The
-        # upstream grayscale template often locks onto static map decorations,
-        # producing a high confidence position that never moves. Therefore a
-        # valid yellow-marker result must always take priority and must not be
-        # mixed with template candidates.
+        # Yellow is the local player. Red dots are other players and are already
+        # rejected by classic_player_candidates(). Never mix yellow candidates
+        # with the legacy grayscale template, which can lock onto static scenery.
         if classic:
             self.player_detection_method = "classic-yellow"
             return _deduplicate(classic)
 
-        # Retain the legacy template only as a last-resort fallback for maps or
-        # UI themes where the yellow marker is temporarily hidden.
         template = _template_candidates(self, minimap)
         self.player_detection_method = "template-fallback" if template else "none"
         return _deduplicate(template)
 
+    def accept_position_fast(self, position: Point):
+        if getattr(self, "player_detection_method", "") == "classic-yellow":
+            # The yellow diamond is small, unique and already shape/color filtered.
+            # Track it immediately instead of applying the old slow EMA and
+            # multi-frame teleport confirmation intended for noisy templates.
+            previous = getattr(self, "_filtered_position", None)
+            if previous is None:
+                filtered = position
+            else:
+                alpha = 0.88
+                filtered = (
+                    alpha * position[0] + (1.0 - alpha) * previous[0],
+                    alpha * position[1] + (1.0 - alpha) * previous[1],
+                )
+            self._filtered_position = filtered
+            self._pending_jump = None
+            self._pending_jump_frames = 0
+            return filtered
+        return original_accept_position(self, position)
+
     capture_class._player_candidates = bounded_player_candidates
+    capture_class._accept_position = accept_position_fast
     capture_class._classic_player_patch_installed = True
