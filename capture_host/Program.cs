@@ -12,7 +12,7 @@ internal static class Program
         "MapleStory"
     };
 
-    private static int Main()
+    private static async Task<int> Main(string[] args)
     {
         Console.OutputEncoding = Encoding.UTF8;
         Console.WriteLine("MapleCaptureHost - Windows Graphics Capture backend");
@@ -23,6 +23,29 @@ internal static class Program
             return 2;
         }
 
+        using var shutdown = new CancellationTokenSource();
+        Console.CancelKeyPress += (_, eventArgs) =>
+        {
+            eventArgs.Cancel = true;
+            shutdown.Cancel();
+        };
+
+        using var output = new SharedFrameBuffer();
+        if (args.Any(arg => string.Equals(arg, "--test-pattern", StringComparison.OrdinalIgnoreCase)))
+        {
+            Console.WriteLine("Publishing deterministic 640x360 BGRA test frames at 30 FPS.");
+            Console.WriteLine("Press Ctrl+C to stop.");
+            try
+            {
+                await TestPatternSource.RunAsync(output, shutdown.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                // Normal Ctrl+C shutdown.
+            }
+            return 0;
+        }
+
         var window = FindTargetWindow();
         if (window.Handle == IntPtr.Zero)
         {
@@ -31,8 +54,9 @@ internal static class Program
         }
 
         Console.WriteLine($"Target window found: '{window.Title}' HWND=0x{window.Handle.ToInt64():X}");
-        Console.WriteLine("Capture pipeline scaffold is ready. The next implementation step is GraphicsCaptureItem + D3D11 frame delivery.");
-        return 0;
+        Console.WriteLine("Shared-frame transport is ready.");
+        Console.WriteLine("GraphicsCaptureItem + D3D11 frame-copy implementation is the remaining host step.");
+        return 4;
     }
 
     private static WindowMatch FindTargetWindow()
