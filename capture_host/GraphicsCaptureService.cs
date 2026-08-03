@@ -7,6 +7,7 @@ using Windows.Graphics.DirectX.Direct3D11;
 using Vortice.Direct3D;
 using Vortice.Direct3D11;
 using Vortice.DXGI;
+using WinRT;
 using static Vortice.Direct3D11.D3D11;
 
 namespace MapleCaptureHost;
@@ -220,8 +221,6 @@ internal static class CaptureInterop
 {
     private const string GraphicsCaptureItemRuntimeClass = "Windows.Graphics.Capture.GraphicsCaptureItem";
 
-    // ABI IID for Windows.Graphics.Capture.IGraphicsCaptureItem.
-    // CreateForWindow requires this interface IID, not the runtime-class GUID.
     private static readonly Guid GraphicsCaptureItemGuid = new("79C3F95B-31F7-4EC2-A464-632EF5D30760");
     private static readonly Guid GraphicsCaptureItemInteropGuid = new("3628E81B-3CAC-4C60-B7F4-23CE0E0C3356");
     private static readonly Guid D3D11Texture2DGuid = typeof(ID3D11Texture2D).GUID;
@@ -246,7 +245,7 @@ internal static class CaptureInterop
             var itemGuid = GraphicsCaptureItemGuid;
             interop.CreateForWindow(hwnd, ref itemGuid, out itemPointer).ThrowOnFailure();
 
-            return WinRT.MarshalInterface<GraphicsCaptureItem>.FromAbi(itemPointer);
+            return MarshalInterface<GraphicsCaptureItem>.FromAbi(itemPointer);
         }
         finally
         {
@@ -272,7 +271,7 @@ internal static class CaptureInterop
         hr.ThrowOnFailure();
         try
         {
-            return WinRT.MarshalInterface<IDirect3DDevice>.FromAbi(inspectable);
+            return MarshalInterface<IDirect3DDevice>.FromAbi(inspectable);
         }
         finally
         {
@@ -282,9 +281,13 @@ internal static class CaptureInterop
 
     public static ID3D11Texture2D GetTexture(IDirect3DSurface surface)
     {
-        var access = (IDirect3DDxgiInterfaceAccess)surface;
+        using var access = surface.As<IDirect3DDxgiInterfaceAccess>();
         var textureGuid = D3D11Texture2DGuid;
-        access.GetInterface(ref textureGuid, out var pointer).ThrowOnFailure();
+        var pointer = access.GetInterface(in textureGuid);
+        if (pointer == IntPtr.Zero)
+        {
+            throw new InvalidOperationException("IDirect3DDxgiInterfaceAccess returned a null texture pointer.");
+        }
         return new ID3D11Texture2D(pointer);
     }
 
@@ -323,10 +326,10 @@ internal static class CaptureInterop
     [ComImport]
     [Guid("A9B3D012-3DF2-4EE3-B8D1-8695F457D3C1")]
     [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    [ComVisible(true)]
     private interface IDirect3DDxgiInterfaceAccess
     {
-        [PreserveSig]
-        int GetInterface(ref Guid iid, out IntPtr pointer);
+        IntPtr GetInterface(in Guid iid);
     }
 
     private static void ThrowOnFailure(this int hr)
