@@ -25,6 +25,7 @@ HEADER = struct.Struct("<IIqiiiiqii")
 MAX_FRAME_BYTES = 2560 * 1440 * 4
 STALE_AFTER_SECONDS = 1.0
 WINDOWS_EPOCH_OFFSET_SECONDS = 11644473600.0
+INVALID_HEADER_RECONNECTS = 8
 
 
 @dataclass(frozen=True)
@@ -50,6 +51,7 @@ class WindowsGraphicsCaptureReader:
         self.last_sequence = 0
         self.last_error: Optional[str] = None
         self.last_frame_time = 0.0
+        self._invalid_header_reads = 0
 
     @property
     def connected(self) -> bool:
@@ -74,8 +76,16 @@ class WindowsGraphicsCaptureReader:
 
     def close(self) -> None:
         mapping, self._mapping = self._mapping, None
+        self._invalid_header_reads = 0
         if mapping is not None:
             mapping.close()
+
+    def _mark_invalid_header(self, message: str) -> None:
+        """Reconnect if Python attached before the host initialized the mapping."""
+        self._invalid_header_reads += 1
+        self.last_error = message
+        if self._invalid_header_reads >= INVALID_HEADER_RECONNECTS:
+            self.close()
 
     def read_latest(self) -> Optional[np.ndarray]:
         if not self.connect() or self._mapping is None:
@@ -86,13 +96,23 @@ class WindowsGraphicsCaptureReader:
             mapping.seek(0)
             first = mapping.read(HEADER.size)
             info1 = self._parse_header(first)
-            if info1 is None or info1.sequence <= 0 or info1.sequence % 2:
+            if info1 is None:
+                self._mark_invalid_header(
+                    "Waiting for MapleCaptureHost to initialize shared memory"
+                )
+                return None
+            if info1.sequence <= 0 or info1.sequence % 2:
+                self._mark_invalid_header(
+                    "Waiting for MapleCaptureHost to publish a complete frame"
+                )
                 return None
 
+            self._invalid_header_reads = 0
             if info1.sequence == self.last_sequence:
                 return None
             if self._is_stale(info1.timestamp_ticks):
                 self.last_error = "Windows Graphics Capture frame is stale"
+                self.close()
                 return None
 
             mapping.seek(info1.header_size)
