@@ -8,7 +8,7 @@ from src.common.logging_config import configure_logging, get_logger
 from src.common.vkeys import release_all
 from src.modules.bot import Bot
 from src.modules.capture import Capture
-from src.modules.classic_minimap import install_classic_minimap_fallback
+from src.modules.classic_vision_backend import install_classic_vision_backend
 from src.modules.classic_player import install_classic_player_fallback
 from src.modules.gui import GUI
 from src.modules.listener import Listener
@@ -44,11 +44,11 @@ def main():
     configure_logging()
     logger.info("Auto Maple startup requested")
 
-    # Windows Graphics Capture is the only frame source on this branch. It is
-    # installed before regional minimap/player fallbacks and before Capture is
-    # instantiated. There is intentionally no desktop-capture fallback.
+    # WGC is the only frame source on this branch. The classic vision backend
+    # replaces the incompatible upstream minimap templates and optionally uses
+    # assets/models/classic_maple.pt when trained YOLO weights are available.
     install_wgc_capture(Capture)
-    install_classic_minimap_fallback(Capture)
+    install_classic_vision_backend(Capture)
     install_classic_player_fallback(Capture)
 
     bot = Bot()
@@ -64,6 +64,7 @@ def main():
     logger.info("Successfully initialized Auto Maple")
     print("\n[~] Successfully initialized Auto Maple")
     print("[~] Capture backend: Windows Graphics Capture")
+    print("[~] Vision backend: Classic geometry / optional YOLO")
     print("[~] Press F12 at any time for emergency stop")
 
     gui = GUI()
