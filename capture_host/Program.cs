@@ -12,6 +12,7 @@ internal static class Program
         "MapleStory"
     };
 
+    [STAThread]
     private static async Task<int> Main(string[] args)
     {
         Console.OutputEncoding = Encoding.UTF8;
@@ -54,9 +55,25 @@ internal static class Program
         }
 
         Console.WriteLine($"Target window found: '{window.Title}' HWND=0x{window.Handle.ToInt64():X}");
-        Console.WriteLine("Shared-frame transport is ready.");
-        Console.WriteLine("GraphicsCaptureItem + D3D11 frame-copy implementation is the remaining host step.");
-        return 4;
+        Console.WriteLine("Starting Windows Graphics Capture. Press Ctrl+C to stop.");
+
+        try
+        {
+            using var capture = new GraphicsCaptureService(window.Handle, output);
+            capture.Start();
+            await Task.Delay(Timeout.Infinite, shutdown.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            return 0;
+        }
+        catch (Exception exception)
+        {
+            Console.Error.WriteLine($"Windows Graphics Capture failed: {exception}");
+            return 4;
+        }
+
+        return 0;
     }
 
     private static WindowMatch FindTargetWindow()
