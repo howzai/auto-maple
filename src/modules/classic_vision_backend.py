@@ -26,6 +26,13 @@ RELOCALIZE_CONFIRMATIONS = 4
 RELOCALIZE_CLUSTER_TOLERANCE = 8
 MAX_SINGLE_STEP_PIXELS = 28
 MAX_SIZE_CHANGE_RATIO = 0.22
+
+# A real map change can alter the minimap from a wide rectangle to a nearly square
+# panel. Permit a much larger resize only when the top-left anchor remains stable
+# and the same new bounds are observed repeatedly.
+ANCHORED_RESIZE_TOP_LEFT_TOLERANCE = 18
+ANCHORED_RESIZE_MAX_WIDTH_RATIO = 1.35
+ANCHORED_RESIZE_MAX_HEIGHT_RATIO = 2.50
 MIN_ACCEPTED_SCORE = 0.62
 
 
@@ -61,14 +68,15 @@ def _valid(frame: np.ndarray, bounds: Bounds) -> bool:
 
     # The classic minimap is anchored close to the upper-left of the game client.
     # Reject detections over the gameplay scenery even if their visual score is high.
+    # Some maps use an almost square minimap, so ratios below 1.0 are valid.
     return (
         0 <= x1 < x2 <= width
         and 0 <= y1 < y2 <= height
         and x1 <= max(90, int(width * 0.10))
         and y1 <= max(90, int(height * 0.14))
         and 110 <= crop_width <= max(380, int(width * 0.36))
-        and 38 <= crop_height <= max(240, int(height * 0.32))
-        and 1.15 <= crop_width / max(crop_height, 1) <= 5.5
+        and 38 <= crop_height <= max(320, int(height * 0.42))
+        and 0.72 <= crop_width / max(crop_height, 1) <= 5.5
     )
 
 
@@ -141,13 +149,30 @@ def _plausible_transition(old_bounds: Bounds, new_bounds: Bounds) -> bool:
     width_ratio = abs(new_width - old_width) / old_width
     height_ratio = abs(new_height - old_height) / old_height
 
-    # Small UI movements are acceptable. Large changes are only accepted after
-    # repeated confirmation and must resemble a genuine expanded/collapsed resize.
-    return (
+    # Normal small UI movement or a minor size adjustment.
+    if (
         top_left_shift <= MAX_SINGLE_STEP_PIXELS
         and width_ratio <= MAX_SIZE_CHANGE_RATIO
         and height_ratio <= MAX_SIZE_CHANGE_RATIO
-    )
+    ):
+        return True
+
+    # Changing maps may turn a wide minimap into a square/tall minimap. The panel's
+    # upper-left anchor remains fixed, while mostly its lower/right edges move.
+    # This path is still protected by repeated confirmation before the ROI changes.
+    if top_left_shift <= ANCHORED_RESIZE_TOP_LEFT_TOLERANCE:
+        width_scale = new_width / max(old_width, 1)
+        height_scale = new_height / max(old_height, 1)
+        return (
+            1.0 / ANCHORED_RESIZE_MAX_WIDTH_RATIO
+            <= width_scale
+            <= ANCHORED_RESIZE_MAX_WIDTH_RATIO
+            and 1.0 / ANCHORED_RESIZE_MAX_HEIGHT_RATIO
+            <= height_scale
+            <= ANCHORED_RESIZE_MAX_HEIGHT_RATIO
+        )
+
+    return False
 
 
 def _apply_location(self, frame, located, ui_snapshot, reset_tracking: bool) -> bool:
