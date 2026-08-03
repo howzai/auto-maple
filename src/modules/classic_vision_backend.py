@@ -18,18 +18,12 @@ Located = Tuple[Bounds, float, str]
 _MODEL = None
 _MODEL_ATTEMPTED = False
 
-# The minimap is fixed in the game's upper-left corner. Once calibrated, keep the
-# crop locked and only move it after several consistent observations. This avoids
-# scenery, monsters and combat effects being mistaken for a new minimap region.
 RELOCALIZE_INTERVAL_SECONDS = 0.75
 RELOCALIZE_CONFIRMATIONS = 4
 RELOCALIZE_CLUSTER_TOLERANCE = 8
 MAX_SINGLE_STEP_PIXELS = 28
 MAX_SIZE_CHANGE_RATIO = 0.22
 
-# A real map change can alter the minimap from a wide rectangle to a nearly square
-# panel. Permit a much larger resize only when the top-left anchor remains stable
-# and the same new bounds are observed repeatedly.
 ANCHORED_RESIZE_TOP_LEFT_TOLERANCE = 18
 ANCHORED_RESIZE_MAX_WIDTH_RATIO = 1.35
 ANCHORED_RESIZE_MAX_HEIGHT_RATIO = 2.50
@@ -52,7 +46,6 @@ def _load_yolo():
 
     try:
         from ultralytics import YOLO
-
         _MODEL = YOLO(str(weights))
     except Exception as exc:
         print(f"\n[!] Classic YOLO model could not be loaded: {exc}")
@@ -65,10 +58,6 @@ def _valid(frame: np.ndarray, bounds: Bounds) -> bool:
     height, width = frame.shape[:2]
     crop_width = x2 - x1
     crop_height = y2 - y1
-
-    # The classic minimap is anchored close to the upper-left of the game client.
-    # Reject detections over the gameplay scenery even if their visual score is high.
-    # Some maps use an almost square minimap, so ratios below 1.0 are valid.
     return (
         0 <= x1 < x2 <= width
         and 0 <= y1 < y2 <= height
@@ -84,7 +73,6 @@ def _find_with_yolo(frame: np.ndarray) -> Optional[Located]:
     model = _load_yolo()
     if model is None:
         return None
-
     try:
         results = model.predict(frame[:, :, :3], imgsz=640, conf=0.55, verbose=False)
     except Exception:
@@ -149,7 +137,6 @@ def _plausible_transition(old_bounds: Bounds, new_bounds: Bounds) -> bool:
     width_ratio = abs(new_width - old_width) / old_width
     height_ratio = abs(new_height - old_height) / old_height
 
-    # Normal small UI movement or a minor size adjustment.
     if (
         top_left_shift <= MAX_SINGLE_STEP_PIXELS
         and width_ratio <= MAX_SIZE_CHANGE_RATIO
@@ -157,9 +144,6 @@ def _plausible_transition(old_bounds: Bounds, new_bounds: Bounds) -> bool:
     ):
         return True
 
-    # Changing maps may turn a wide minimap into a square/tall minimap. The panel's
-    # upper-left anchor remains fixed, while mostly its lower/right edges move.
-    # This path is still protected by repeated confirmation before the ROI changes.
     if top_left_shift <= ANCHORED_RESIZE_TOP_LEFT_TOLERANCE:
         width_scale = new_width / max(old_width, 1)
         height_scale = new_height / max(old_height, 1)
@@ -171,8 +155,23 @@ def _plausible_transition(old_bounds: Bounds, new_bounds: Bounds) -> bool:
             <= height_scale
             <= ANCHORED_RESIZE_MAX_HEIGHT_RATIO
         )
-
     return False
+
+
+def _publish_frame_heartbeat(self, frame: np.ndarray) -> float:
+    """Publish a fresh frame timestamp even while minimap calibration is running.
+
+    Without this heartbeat the watchdog interprets calibration as a stalled WGC
+    stream, clears ``calibrated`` again, and creates an endless recalibration loop.
+    """
+    now = time.monotonic()
+    with self._state_lock:
+        self.frame = frame
+        self.frame_id += 1
+        self.last_frame_time = now
+        self.window["width"] = frame.shape[1]
+        self.window["height"] = frame.shape[0]
+    return now
 
 
 def _apply_location(self, frame, located, ui_snapshot, reset_tracking: bool) -> bool:
@@ -189,12 +188,17 @@ def _apply_location(self, frame, located, ui_snapshot, reset_tracking: bool) -> 
 
     width = x2 - x1
     height = y2 - y1
+    now = time.monotonic()
     with self._state_lock:
         self._minimap_tl = top_left
         self._minimap_br = bottom_right
         self.minimap_ratio = width / max(height, 1)
         self.minimap_sample = sample.copy()
         self.frame = frame
+        self.frame_id += 1
+        self.last_frame_time = now
+        self.window["width"] = frame.shape[1]
+        self.window["height"] = frame.shape[0]
         self.calibrated = True
         self.last_error = None
         self.calibration_method = method
@@ -215,6 +219,9 @@ def install_classic_vision_backend(capture_class) -> None:
         frame = self.screenshot(delay=0)
         if frame is None:
             return False
+
+        # Keep GUI frame age and watchdog state live during every calibration try.
+        _publish_frame_heartbeat(self, frame)
 
         result = locate_classic_minimap(frame)
         if result is None:
@@ -262,8 +269,6 @@ def install_classic_vision_backend(capture_class) -> None:
         new_bounds = located[0]
         old_bounds = (self._minimap_tl, self._minimap_br)
 
-        # The currently locked crop is still effectively the same. Clear any
-        # pending relocation and keep using it without touching player tracking.
         if _bounds_distance(old_bounds, new_bounds) <= RELOCALIZE_CLUSTER_TOLERANCE:
             self._classic_pending_bounds = None
             self._classic_pending_count = 0
