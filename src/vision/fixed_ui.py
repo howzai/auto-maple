@@ -1,8 +1,10 @@
 """Fast fixed-UI localization for the Traditional Chinese classic client.
 
-The minimap is anchored to the upper-left of the captured game client. Detection
-uses a small candidate set, but validates the real panel borders so the crop does
-not spill into the gameplay scene.
+The classic minimap is not located from the moving map artwork.  Instead, this
+module finds the fixed orange/yellow ``地圖`` button in the title bar, uses it as
+the panel's right-hand anchor, and then follows the panel chrome down to the real
+bottom border.  The resulting crop therefore remains stable when monsters,
+players, scenery, or combat effects move behind the panel.
 """
 
 from __future__ import annotations
@@ -64,33 +66,88 @@ def _clip_bounds(frame: np.ndarray, bounds: Bounds) -> Optional[Bounds]:
     return (x1, y1), (x2, y2)
 
 
-def _light_fraction(strip: np.ndarray, threshold: int = 135) -> float:
-    if strip.size == 0:
-        return 0.0
-    return float(np.mean(strip >= threshold))
+def _find_map_button(frame: np.ndarray) -> Optional[Tuple[int, int, int, int, float]]:
+    """Find the orange/yellow map button in the upper-left title bar."""
+    height, width = frame.shape[:2]
+    search_w = min(width, max(260, int(width * 0.24)))
+    search_h = min(height, max(52, int(height * 0.10)))
+    roi = frame[:search_h, :search_w, :3]
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+
+    # The classic client's map button is a saturated orange/yellow rectangle.
+    mask = cv2.inRange(hsv, np.array((8, 105, 125), dtype=np.uint8),
+                      np.array((38, 255, 255), dtype=np.uint8))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE,
+                            np.ones((3, 5), dtype=np.uint8), iterations=1)
+
+    count, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    candidates = []
+    for index in range(1, count):
+        x, y, w, h, area = (int(v) for v in stats[index])
+        if not (18 <= w <= 105 and 9 <= h <= 42 and area >= 120):
+            continue
+        if y > 38 or x < 55:
+            continue
+        fill = area / float(max(w * h, 1))
+        aspect = w / float(max(h, 1))
+        if not (1.25 <= aspect <= 6.5 and fill >= 0.34):
+            continue
+        # Prefer the rightmost, well-filled title-bar rectangle.
+        score = 0.55 * fill + 0.25 * min(1.0, aspect / 3.0) + 0.20 * (x / search_w)
+        candidates.append((score, x, y, x + w, y + h))
+
+    if not candidates:
+        return None
+    score, x1, y1, x2, y2 = max(candidates, key=lambda item: item[0])
+    return x1, y1, x2, y2, float(score)
 
 
-def _border_scores(gray: np.ndarray, bounds: Bounds) -> Tuple[float, float, float, float]:
-    (x1, y1), (x2, y2) = bounds
-    top = _light_fraction(gray[y1:min(y1 + 4, y2), x1:x2])
-    bottom = _light_fraction(gray[max(y2 - 5, y1):y2, x1:x2])
-    left = _light_fraction(gray[y1:y2, x1:min(x1 + 4, x2)])
-    right = _light_fraction(gray[y1:y2, max(x2 - 5, x1):x2])
-    return top, bottom, left, right
+def _first_dark_run(frame: np.ndarray, x1: int, x2: int, start_y: int,
+                    end_y: int) -> Optional[int]:
+    """Find where the actual dark minimap canvas begins below the title area."""
+    value = np.max(frame[:, :, :3], axis=2)
+    inner_x1 = min(x2 - 1, x1 + 5)
+    inner_x2 = max(inner_x1 + 1, x2 - 5)
+    consecutive = 0
+    first = None
+    for y in range(max(0, start_y), min(end_y, frame.shape[0])):
+        row = value[y:y + 1, inner_x1:inner_x2]
+        dark_fraction = float(np.mean(row < 175)) if row.size else 0.0
+        if dark_fraction >= 0.58:
+            if consecutive == 0:
+                first = y
+            consecutive += 1
+            if consecutive >= 3:
+                return first
+        else:
+            consecutive = 0
+            first = None
+    return None
 
 
-def _canvas_score(frame: np.ndarray, gray: np.ndarray, bounds: Bounds) -> float:
-    (x1, y1), (x2, y2) = bounds
-    crop = frame[y1:y2, x1:x2, :3]
-    gray_crop = gray[y1:y2, x1:x2]
-    if crop.size == 0 or gray_crop.size == 0:
-        return 0.0
+def _find_bottom_border(frame: np.ndarray, x1: int, x2: int, canvas_top: int,
+                        max_y: int) -> Optional[Tuple[int, float]]:
+    """Find the first pale horizontal border below the dark map canvas."""
+    gray = cv2.cvtColor(frame[:, :, :3], cv2.COLOR_BGR2GRAY)
+    inner_x1 = min(x2 - 1, x1 + 2)
+    inner_x2 = max(inner_x1 + 1, x2 - 2)
+    run_start = None
+    run_scores = []
 
-    value = np.max(crop, axis=2)
-    dark_fraction = float(np.mean(value < 178))
-    edges = cv2.Canny(gray_crop, 40, 120)
-    edge_density = float(np.count_nonzero(edges)) / float(edges.size)
-    return min(1.0, 0.74 * dark_fraction + 0.26 * min(1.0, edge_density / 0.10))
+    for y in range(canvas_top + 24, min(max_y, frame.shape[0] - 1)):
+        row = gray[y:y + 1, inner_x1:inner_x2]
+        light = float(np.mean(row >= 145)) if row.size else 0.0
+        if light >= 0.48:
+            if run_start is None:
+                run_start = y
+                run_scores = []
+            run_scores.append(light)
+            if len(run_scores) >= 2:
+                return run_start, float(np.mean(run_scores))
+        else:
+            run_start = None
+            run_scores = []
+    return None
 
 
 def _locate_minimap(frame: np.ndarray) -> Optional[Tuple[UiRegion, UiRegion]]:
@@ -98,77 +155,69 @@ def _locate_minimap(frame: np.ndarray) -> Optional[Tuple[UiRegion, UiRegion]]:
     if width < 800 or height < 500:
         return None
 
-    gray = cv2.cvtColor(frame[:, :, :3], cv2.COLOR_BGR2GRAY)
+    button = _find_map_button(frame)
+    if button is None:
+        return None
+    bx1, by1, bx2, by2, button_score = button
 
-    # In the user's current client the complete panel is about 11-14% of the
-    # captured client width. Previous 15-17% candidates included sky/scenery on
-    # the right and made the player marker coordinates incorrect.
-    x_candidates = (0, 2, 4, 6, 8, 10, 12)
-    y_candidates = tuple(sorted(set((
-        0, 4, 8, 12, 16, 20, 24,
-        int(round(height * 0.025)),
-        int(round(height * 0.035)),
-    ))))
-    width_ratios = (0.105, 0.1125, 0.120, 0.128, 0.136, 0.144)
-    height_ratios = (0.180, 0.205, 0.235, 0.280, 0.340, 0.405)
-
-    header_h = max(48, min(86, int(round(height * 0.090))))
-    candidates = []
-
-    for x in x_candidates:
-        for y in y_candidates:
-            for wr in width_ratios:
-                panel_w = int(round(width * wr))
-                margin_x = max(4, int(round(panel_w * 0.028)))
-                for hr in height_ratios:
-                    panel_h = int(round(height * hr))
-                    panel_bounds = _clip_bounds(frame, ((x, y), (x + panel_w, y + panel_h)))
-                    if panel_bounds is None:
-                        continue
-
-                    top, bottom, left, right = _border_scores(gray, panel_bounds)
-                    # The right and bottom borders are essential. If they are weak,
-                    # the candidate usually extends into the moving game scene.
-                    if right < 0.30 or bottom < 0.24 or left < 0.22:
-                        continue
-
-                    canvas_bounds = _clip_bounds(
-                        frame,
-                        (
-                            (x + margin_x, y + header_h),
-                            (x + panel_w - margin_x, y + panel_h - 7),
-                        ),
-                    )
-                    if canvas_bounds is None:
-                        continue
-
-                    (cx1, cy1), (cx2, cy2) = canvas_bounds
-                    canvas_w, canvas_h = cx2 - cx1, cy2 - cy1
-                    if canvas_w < 95 or canvas_h < 32:
-                        continue
-                    ratio = canvas_w / max(canvas_h, 1)
-                    if not 0.62 <= ratio <= 5.8:
-                        continue
-
-                    canvas = _canvas_score(frame, gray, canvas_bounds)
-                    chrome = 0.15 * top + 0.25 * bottom + 0.20 * left + 0.40 * right
-                    # Slightly prefer the smallest valid enclosure. This prevents a
-                    # wider candidate from winning merely because the sky is dark.
-                    compact_bonus = 0.06 * (1.0 - panel_w / max(width * 0.15, 1))
-                    score = 0.58 * chrome + 0.42 * canvas + compact_bonus
-                    candidates.append((score, panel_bounds, canvas_bounds))
-
-    if not candidates:
+    # The title begins a few pixels above the button and the button's right edge is
+    # immediately inside the panel's right border.  The panel itself is anchored
+    # to the client upper-left, so no moving gameplay pixels are used as anchors.
+    panel_left = 0
+    panel_top = max(0, by1 - 5)
+    panel_right = min(width, bx2 + 4)
+    if panel_right < 105 or panel_right > min(420, int(width * 0.34)):
         return None
 
-    score, panel_bounds, canvas_bounds = max(candidates, key=lambda item: item[0])
-    if score < 0.38:
+    search_bottom = min(height, max(190, int(height * 0.46)))
+    canvas_top = _first_dark_run(
+        frame,
+        panel_left,
+        panel_right,
+        start_y=by2 + 3,
+        end_y=min(search_bottom, by2 + 145),
+    )
+    if canvas_top is None:
         return None
 
-    method = "classic-border-anchor-v7"
+    bottom = _find_bottom_border(
+        frame,
+        panel_left,
+        panel_right,
+        canvas_top=canvas_top,
+        max_y=search_bottom,
+    )
+    if bottom is None:
+        return None
+    border_y, border_score = bottom
+
+    panel_bottom = min(height, border_y + 7)
+    canvas_left = panel_left + 4
+    canvas_right = panel_right - 5
+    canvas_bottom = max(canvas_top + 1, border_y - 2)
+
+    panel_bounds = _clip_bounds(
+        frame, ((panel_left, panel_top), (panel_right, panel_bottom))
+    )
+    canvas_bounds = _clip_bounds(
+        frame, ((canvas_left, canvas_top), (canvas_right, canvas_bottom))
+    )
+    if panel_bounds is None or canvas_bounds is None:
+        return None
+
+    (cx1, cy1), (cx2, cy2) = canvas_bounds
+    canvas_w, canvas_h = cx2 - cx1, cy2 - cy1
+    if canvas_w < 90 or canvas_h < 30:
+        return None
+    ratio = canvas_w / float(max(canvas_h, 1))
+    if not 0.55 <= ratio <= 6.5:
+        return None
+
+    confidence = min(1.0, 0.58 * button_score + 0.42 * border_score)
+    method = "classic-title-border-anchor-v8"
     return (
-        UiRegion("minimap_panel", panel_bounds, float(score), method),
-        UiRegion("minimap_canvas", canvas_bounds, float(score), method),
+        UiRegion("minimap_panel", panel_bounds, confidence, method),
+        UiRegion("minimap_canvas", canvas_bounds, confidence, method),
     )
 
 
