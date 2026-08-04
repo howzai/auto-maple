@@ -1,5 +1,6 @@
 import tkinter as tk
 
+from src.common import config
 from src.gui.interfaces import LabelFrame
 
 
@@ -30,6 +31,10 @@ class Status(LabelFrame):
         self.player_confidence = tk.StringVar(value='0%')
         self.player_position = tk.StringVar(value='—')
         self.frame_age = tk.StringVar(value='—')
+        self.scene_model = tk.StringVar(value='Starting')
+        self.scene_counts = tk.StringVar(value='M 0 · L 0 · O 0')
+        self.nearest_monster = tk.StringVar(value='None')
+        self.scene_event = tk.StringVar(value='Waiting')
         self.last_error = tk.StringVar(value='None')
 
         self._add_row(0, 'Command Book:', self.curr_cb)
@@ -39,7 +44,11 @@ class Status(LabelFrame):
         self._add_row(4, 'Player confidence:', self.player_confidence)
         self._add_row(5, 'Player position:', self.player_position)
         self._add_row(6, 'Frame age:', self.frame_age)
-        self._add_row(7, 'Last error:', self.last_error, wrap=True)
+        self._add_row(7, 'Scene model:', self.scene_model)
+        self._add_row(8, 'Scene objects:', self.scene_counts)
+        self._add_row(9, 'Nearest monster:', self.nearest_monster)
+        self._add_row(10, 'Vision event:', self.scene_event, wrap=True)
+        self._add_row(11, 'Last error:', self.last_error, wrap=True)
 
     def _add_row(self, row, label_text, variable, wrap=False):
         label = tk.Label(self, text=label_text)
@@ -66,7 +75,7 @@ class Status(LabelFrame):
         self.curr_routine.set(string)
 
     def update_health(self, health):
-        """Render a RuntimeHealthSnapshot on the Tk main thread."""
+        """Render runtime and scene-observer state on the Tk main thread."""
         capture = health.capture
         state = STATUS_LABELS.get(health.status, health.status)
         mode = 'Enabled' if health.enabled else 'Paused'
@@ -85,4 +94,28 @@ class Status(LabelFrame):
         else:
             self.frame_age.set(f'{health.capture_frame_age:.2f} s')
 
-        self.last_error.set(capture.last_error or 'None')
+        observer = getattr(config, 'scene_observer', None)
+        scene = observer.snapshot() if observer is not None else None
+        if scene is None:
+            self.scene_model.set('Unavailable')
+            self.scene_counts.set('M 0 · L 0 · O 0')
+            self.nearest_monster.set('None')
+            self.scene_event.set('Scene observer unavailable')
+        else:
+            debug_suffix = ' · Debug' if getattr(observer, 'debug_enabled', False) else ''
+            self.scene_model.set(f'{scene.model_status}{debug_suffix}')
+            self.scene_counts.set(
+                f'M {len(scene.monsters)} · L {len(scene.ladders)} · O {len(scene.obstacles)}'
+            )
+            if scene.nearest_monster_distance is None:
+                self.nearest_monster.set('None')
+            else:
+                self.nearest_monster.set(
+                    f'{scene.nearest_monster_direction} · {scene.nearest_monster_distance:.0f}px'
+                )
+            self.scene_event.set(scene.last_event)
+
+        errors = [capture.last_error]
+        if scene is not None:
+            errors.append(scene.last_error)
+        self.last_error.set(next((error for error in errors if error), 'None'))
