@@ -32,15 +32,37 @@ class Listener(Configurable):
         self.ready = False
         self.block_time = 0
         self._previously_pressed = set()
+        self._reported_invalid_hotkeys = set()
         self.thread = threading.Thread(target=self._main, name='keyboard-listener', daemon=True)
 
     def start(self):
         print('\n[~] Started keyboard listener')
         self.thread.start()
 
+    def _configured_key(self, action):
+        """Return a usable configured key, falling back when old configs contain blanks."""
+        default = self.DEFAULT_CONFIG.get(action, '')
+        value = self.config.get(action, default)
+        key = '' if value is None else str(value).strip().lower()
+        if not key:
+            key = str(default).strip().lower()
+            if action not in self._reported_invalid_hotkeys:
+                print(
+                    f"\n[!] Empty hotkey setting for '{action}' was replaced with '{key}'"
+                )
+                self._reported_invalid_hotkeys.add(action)
+            self.config[action] = key
+        return key
+
     def _pressed_once(self, key):
-        key = str(key).lower()
-        pressed = kb.is_pressed(key)
+        """Return True once per press and never pass an empty name to keyboard."""
+        key = '' if key is None else str(key).strip().lower()
+        if not key:
+            return False
+        try:
+            pressed = kb.is_pressed(key)
+        except (ValueError, TypeError, KeyError):
+            return False
         if pressed:
             if key not in self._previously_pressed:
                 self._previously_pressed.add(key)
@@ -53,10 +75,10 @@ class Listener(Configurable):
         self.ready = True
         while True:
             try:
-                emergency_key = self.config.get('Emergency stop', 'f12')
-                record_start_key = self.config.get('Start recording', 'f8')
-                record_stop_key = self.config.get('Stop recording', 'f9')
-                debug_key = self.config.get('Vision debug', 'f10')
+                emergency_key = self._configured_key('Emergency stop')
+                record_start_key = self._configured_key('Start recording')
+                record_stop_key = self._configured_key('Stop recording')
+                debug_key = self._configured_key('Vision debug')
                 if self._pressed_once(emergency_key):
                     self.emergency_stop()
                 elif self._pressed_once(record_start_key):
@@ -66,9 +88,9 @@ class Listener(Configurable):
                 elif self._pressed_once(debug_key):
                     self.toggle_vision_debug()
                 elif self.enabled:
-                    if self._pressed_once(self.config['Start/stop']):
+                    if self._pressed_once(self._configured_key('Start/stop')):
                         Listener.toggle_enabled()
-                    elif self._pressed_once(self.config['Reload routine']):
+                    elif self._pressed_once(self._configured_key('Reload routine')):
                         Listener.reload_routine()
                     elif self.restricted_pressed('Record position'):
                         Listener.record_position()
@@ -80,7 +102,7 @@ class Listener(Configurable):
             time.sleep(self.POLL_INTERVAL)
 
     def restricted_pressed(self, action):
-        key = self.config[action]
+        key = self._configured_key(action)
         if self._pressed_once(key):
             if not config.enabled:
                 return True
