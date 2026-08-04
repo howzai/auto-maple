@@ -23,25 +23,20 @@ class GUI:
 
     def __init__(self):
         config.gui = self
-
         self.root = tk.Tk()
         self.root.title('Auto Maple')
         icon = tk.PhotoImage(file='assets/icon.png')
         self.root.iconphoto(False, icon)
         self.root.geometry(GUI.RESOLUTIONS['DEFAULT'])
         self.root.resizable(False, False)
-
         self.routine_var = tk.StringVar()
         self._closing = False
-
         self.menu = Menu(self.root)
         self.root.config(menu=self.menu)
-
         self.navigation = ttk.Notebook(self.root)
         self.view = View(self.navigation)
         self.edit = Edit(self.navigation)
         self.settings = Settings(self.navigation)
-
         self.navigation.pack(expand=True, fill='both')
         self.navigation.bind('<<NotebookTabChanged>>', self._resize_window)
         self.root.protocol('WM_DELETE_WINDOW', self._on_close)
@@ -53,7 +48,6 @@ class GUI:
     def clear_routine_info(self):
         self.view.details.clear_info()
         self.view.status.set_routine('')
-
         self.edit.minimap.redraw()
         self.edit.routine.commands.clear_contents()
         self.edit.routine.commands.update_display()
@@ -68,15 +62,9 @@ class GUI:
             self.root.geometry(GUI.RESOLUTIONS.get(page, GUI.RESOLUTIONS['DEFAULT']))
 
     def start(self):
-        """Start scheduled GUI updates and enter the Tk event loop."""
         self._schedule_minimap_refresh()
         self._schedule_health_refresh()
-
-        layout_thread = threading.Thread(
-            target=self._save_layout,
-            name='layout-autosave',
-            daemon=True,
-        )
+        layout_thread = threading.Thread(target=self._save_layout, name='layout-autosave', daemon=True)
         layout_thread.start()
         self.root.mainloop()
 
@@ -98,7 +86,6 @@ class GUI:
             self.root.after(GUI.HEALTH_REFRESH_MS, self._schedule_health_refresh)
 
     def _save_layout(self):
-        """Periodically save the current Layout object."""
         while not self._closing:
             if config.layout is not None and settings.record_layout:
                 try:
@@ -110,6 +97,9 @@ class GUI:
     def _on_close(self):
         self._closing = True
         config.enabled = False
+        recorder = getattr(config, 'data_recorder', None)
+        if recorder is not None and hasattr(recorder, 'stop'):
+            recorder.stop()
         observer = getattr(config, 'scene_observer', None)
         if observer is not None and hasattr(observer, 'stop'):
             observer.stop()
