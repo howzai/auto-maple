@@ -38,8 +38,11 @@ bot = None
 # Shares the video capture loop
 capture = None
 
-# Shares the observation-only main-scene vision worker
+# Shares the main-scene observer
 scene_observer = None
+
+# Shares the manual-demonstration dataset recorder
+data_recorder = None
 
 # Shares the keyboard listener
 listener = None
