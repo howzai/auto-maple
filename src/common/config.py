@@ -38,6 +38,9 @@ bot = None
 # Shares the video capture loop
 capture = None
 
+# Shares the observation-only main-scene vision worker
+scene_observer = None
+
 # Shares the keyboard listener
 listener = None
 
