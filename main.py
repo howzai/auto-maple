@@ -13,6 +13,7 @@ from src.modules.classic_player import install_classic_player_fallback
 from src.modules.gui import GUI
 from src.modules.listener import Listener
 from src.modules.notifier import Notifier
+from src.modules.scene_observer import SceneObserver
 from src.modules.wgc_capture_backend import install_wgc_capture
 
 
@@ -44,27 +45,28 @@ def main():
     configure_logging()
     logger.info("Auto Maple startup requested")
 
-    # WGC is the only frame source on this branch. The classic vision backend
-    # replaces the incompatible upstream minimap templates and optionally uses
-    # assets/models/classic_maple.pt when trained YOLO weights are available.
     install_wgc_capture(Capture)
     install_classic_vision_backend(Capture)
     install_classic_player_fallback(Capture)
 
     bot = Bot()
     capture = Capture()
+    scene_observer = SceneObserver()
     notifier = Notifier()
     listener = Listener()
 
     _start_and_wait(bot, "Bot")
     _start_and_wait(capture, "Capture")
+    _start_and_wait(scene_observer, "Scene Observer")
     _start_and_wait(notifier, "Notifier")
     _start_and_wait(listener, "Listener")
 
     logger.info("Successfully initialized Auto Maple")
     print("\n[~] Successfully initialized Auto Maple")
     print("[~] Capture backend: Windows Graphics Capture")
-    print("[~] Vision backend: Classic geometry / optional YOLO")
+    print("[~] Minimap vision: Classic fixed-UI geometry")
+    print("[~] Main-scene vision: Observation only / optional YOLO")
+    print("[~] Press F10 to toggle vision debug data")
     print("[~] Press F12 at any time for emergency stop")
 
     gui = GUI()
@@ -85,6 +87,12 @@ if __name__ == "__main__":
         print("\n[!] Auto Maple failed to start; see logs/auto-maple.log")
     finally:
         config.enabled = False
+        observer = getattr(config, "scene_observer", None)
+        if observer is not None:
+            try:
+                observer.stop()
+            except Exception:
+                logger.exception("Scene observer shutdown failed")
         capture = getattr(config, "capture", None)
         if capture is not None:
             try:
