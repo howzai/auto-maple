@@ -1,10 +1,10 @@
 """Fast fixed-UI localization for the Traditional Chinese classic client.
 
-The classic minimap is not located from the moving map artwork.  Instead, this
-module finds the fixed orange/yellow ``地圖`` button in the title bar, uses it as
-the panel's right-hand anchor, and then follows the panel chrome down to the real
-bottom border.  The resulting crop therefore remains stable when monsters,
-players, scenery, or combat effects move behind the panel.
+The minimap is anchored by fixed UI chrome, never by moving map artwork.  The
+locator finds the orange ``地圖`` button (or the pale title-bar fallback), uses
+that to determine the panel width, then scans for the first truly full-width
+bottom border.  All work is limited to a small upper-left ROI so startup remains
+fast and player-marker tracking is not delayed.
 """
 
 from __future__ import annotations
@@ -66,34 +66,41 @@ def _clip_bounds(frame: np.ndarray, bounds: Bounds) -> Optional[Bounds]:
     return (x1, y1), (x2, y2)
 
 
-def _find_map_button(frame: np.ndarray) -> Optional[Tuple[int, int, int, int, float]]:
-    """Find the orange/yellow map button in the upper-left title bar."""
-    height, width = frame.shape[:2]
-    search_w = min(width, max(260, int(width * 0.24)))
-    search_h = min(height, max(52, int(height * 0.10)))
-    roi = frame[:search_h, :search_w, :3]
-    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+def _find_map_button(roi: np.ndarray) -> Optional[Tuple[int, int, int, int, float]]:
+    """Find the saturated orange/yellow map button in a small top-left ROI."""
+    hsv = cv2.cvtColor(roi[:, :, :3], cv2.COLOR_BGR2HSV)
 
-    # The classic client's map button is a saturated orange/yellow rectangle.
-    mask = cv2.inRange(hsv, np.array((8, 105, 125), dtype=np.uint8),
-                      np.array((38, 255, 255), dtype=np.uint8))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE,
-                            np.ones((3, 5), dtype=np.uint8), iterations=1)
+    # Two masks cover both the deeper orange and pale yellow client variants.
+    orange = cv2.inRange(
+        hsv,
+        np.array((5, 70, 105), dtype=np.uint8),
+        np.array((43, 255, 255), dtype=np.uint8),
+    )
+    yellow = cv2.inRange(
+        hsv,
+        np.array((18, 45, 145), dtype=np.uint8),
+        np.array((48, 255, 255), dtype=np.uint8),
+    )
+    mask = cv2.bitwise_or(orange, yellow)
+    mask = cv2.morphologyEx(
+        mask, cv2.MORPH_CLOSE, np.ones((3, 5), dtype=np.uint8), iterations=1
+    )
 
     count, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
     candidates = []
+    roi_h, roi_w = roi.shape[:2]
     for index in range(1, count):
         x, y, w, h, area = (int(v) for v in stats[index])
-        if not (18 <= w <= 105 and 9 <= h <= 42 and area >= 120):
+        if not (16 <= w <= 125 and 8 <= h <= 48 and area >= 85):
             continue
-        if y > 38 or x < 55:
+        if x < 45 or y > min(70, roi_h - 1):
             continue
         fill = area / float(max(w * h, 1))
         aspect = w / float(max(h, 1))
-        if not (1.25 <= aspect <= 6.5 and fill >= 0.34):
+        if fill < 0.24 or not 1.05 <= aspect <= 8.0:
             continue
-        # Prefer the rightmost, well-filled title-bar rectangle.
-        score = 0.55 * fill + 0.25 * min(1.0, aspect / 3.0) + 0.20 * (x / search_w)
+        # The real button is normally the rightmost compact title-bar component.
+        score = 0.48 * fill + 0.22 * min(1.0, aspect / 3.0) + 0.30 * (x / roi_w)
         candidates.append((score, x, y, x + w, y + h))
 
     if not candidates:
@@ -102,18 +109,32 @@ def _find_map_button(frame: np.ndarray) -> Optional[Tuple[int, int, int, int, fl
     return x1, y1, x2, y2, float(score)
 
 
-def _first_dark_run(frame: np.ndarray, x1: int, x2: int, start_y: int,
-                    end_y: int) -> Optional[int]:
-    """Find where the actual dark minimap canvas begins below the title area."""
-    value = np.max(frame[:, :, :3], axis=2)
-    inner_x1 = min(x2 - 1, x1 + 5)
-    inner_x2 = max(inner_x1 + 1, x2 - 5)
+def _fallback_panel_right(gray: np.ndarray) -> Optional[Tuple[int, float]]:
+    """Find the pale right panel edge when color-button detection misses."""
+    h, w = gray.shape
+    top_h = min(h, 78)
+    for x in range(min(w - 1, 360), 105, -1):
+        strip = gray[:top_h, max(0, x - 2):min(w, x + 2)]
+        if strip.size == 0:
+            continue
+        light = float(np.mean(strip >= 150))
+        if light >= 0.42:
+            return x, min(1.0, light + 0.18)
+    return None
+
+
+def _find_canvas_top(gray: np.ndarray, panel_right: int, start_y: int, end_y: int) -> Optional[int]:
+    x1 = 4
+    x2 = max(x1 + 1, panel_right - 5)
     consecutive = 0
     first = None
-    for y in range(max(0, start_y), min(end_y, frame.shape[0])):
-        row = value[y:y + 1, inner_x1:inner_x2]
-        dark_fraction = float(np.mean(row < 175)) if row.size else 0.0
-        if dark_fraction >= 0.58:
+    for y in range(max(0, start_y), min(end_y, gray.shape[0])):
+        row = gray[y:y + 1, x1:x2]
+        if row.size == 0:
+            continue
+        # Map canvas is predominantly dark blue/gray across most of its width.
+        dark_fraction = float(np.mean(row < 155))
+        if dark_fraction >= 0.68:
             if consecutive == 0:
                 first = y
             consecutive += 1
@@ -125,28 +146,31 @@ def _first_dark_run(frame: np.ndarray, x1: int, x2: int, start_y: int,
     return None
 
 
-def _find_bottom_border(frame: np.ndarray, x1: int, x2: int, canvas_top: int,
+def _find_bottom_border(gray: np.ndarray, panel_right: int, canvas_top: int,
                         max_y: int) -> Optional[Tuple[int, float]]:
-    """Find the first pale horizontal border below the dark map canvas."""
-    gray = cv2.cvtColor(frame[:, :, :3], cv2.COLOR_BGR2GRAY)
-    inner_x1 = min(x2 - 1, x1 + 2)
-    inner_x2 = max(inner_x1 + 1, x2 - 2)
+    """Find a continuous full-width pale border, ignoring map platforms."""
+    x1 = 1
+    x2 = max(x1 + 1, panel_right - 1)
     run_start = None
-    run_scores = []
+    scores = []
 
-    for y in range(canvas_top + 24, min(max_y, frame.shape[0] - 1)):
-        row = gray[y:y + 1, inner_x1:inner_x2]
-        light = float(np.mean(row >= 145)) if row.size else 0.0
-        if light >= 0.48:
+    for y in range(canvas_top + 28, min(max_y, gray.shape[0] - 1)):
+        row = gray[y:y + 1, x1:x2]
+        if row.size == 0:
+            continue
+        # A real UI border spans nearly the whole panel. Platforms and scenery do
+        # not, so require a much higher full-row light fraction than before.
+        light = float(np.mean(row >= 145))
+        if light >= 0.76:
             if run_start is None:
                 run_start = y
-                run_scores = []
-            run_scores.append(light)
-            if len(run_scores) >= 2:
-                return run_start, float(np.mean(run_scores))
+                scores = []
+            scores.append(light)
+            if len(scores) >= 2:
+                return run_start, float(np.mean(scores))
         else:
             run_start = None
-            run_scores = []
+            scores = []
     return None
 
 
@@ -155,52 +179,55 @@ def _locate_minimap(frame: np.ndarray) -> Optional[Tuple[UiRegion, UiRegion]]:
     if width < 800 or height < 500:
         return None
 
-    button = _find_map_button(frame)
-    if button is None:
-        return None
-    bx1, by1, bx2, by2, button_score = button
+    search_w = min(width, max(260, int(width * 0.25)))
+    search_h = min(height, max(220, int(height * 0.48)))
+    roi = frame[:search_h, :search_w, :3]
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
 
-    # The title begins a few pixels above the button and the button's right edge is
-    # immediately inside the panel's right border.  The panel itself is anchored
-    # to the client upper-left, so no moving gameplay pixels are used as anchors.
-    panel_left = 0
-    panel_top = max(0, by1 - 5)
-    panel_right = min(width, bx2 + 4)
-    if panel_right < 105 or panel_right > min(420, int(width * 0.34)):
+    button = _find_map_button(roi)
+    if button is not None:
+        _, by1, bx2, by2, anchor_score = button
+        panel_right = min(search_w, bx2 + 4)
+        panel_top = max(0, by1 - 6)
+        canvas_search_start = by2 + 2
+    else:
+        fallback = _fallback_panel_right(gray)
+        if fallback is None:
+            return None
+        panel_right, anchor_score = fallback
+        panel_top = 0
+        canvas_search_start = 18
+
+    if not 105 <= panel_right <= min(430, int(width * 0.35)):
         return None
 
-    search_bottom = min(height, max(190, int(height * 0.46)))
-    canvas_top = _first_dark_run(
-        frame,
-        panel_left,
+    canvas_top = _find_canvas_top(
+        gray,
         panel_right,
-        start_y=by2 + 3,
-        end_y=min(search_bottom, by2 + 145),
+        start_y=canvas_search_start,
+        end_y=min(search_h, canvas_search_start + 165),
     )
     if canvas_top is None:
         return None
 
     bottom = _find_bottom_border(
-        frame,
-        panel_left,
+        gray,
         panel_right,
         canvas_top=canvas_top,
-        max_y=search_bottom,
+        max_y=search_h,
     )
     if bottom is None:
         return None
     border_y, border_score = bottom
 
-    panel_bottom = min(height, border_y + 7)
-    canvas_left = panel_left + 4
-    canvas_right = panel_right - 5
-    canvas_bottom = max(canvas_top + 1, border_y - 2)
-
-    panel_bounds = _clip_bounds(
-        frame, ((panel_left, panel_top), (panel_right, panel_bottom))
-    )
+    panel_bottom = min(height, border_y + 8)
     canvas_bounds = _clip_bounds(
-        frame, ((canvas_left, canvas_top), (canvas_right, canvas_bottom))
+        frame,
+        ((4, canvas_top), (panel_right - 5, max(canvas_top + 1, border_y - 2))),
+    )
+    panel_bounds = _clip_bounds(
+        frame,
+        ((0, panel_top), (panel_right, panel_bottom)),
     )
     if panel_bounds is None or canvas_bounds is None:
         return None
@@ -210,11 +237,13 @@ def _locate_minimap(frame: np.ndarray) -> Optional[Tuple[UiRegion, UiRegion]]:
     if canvas_w < 90 or canvas_h < 30:
         return None
     ratio = canvas_w / float(max(canvas_h, 1))
-    if not 0.55 <= ratio <= 6.5:
+    if not 0.50 <= ratio <= 7.0:
         return None
 
-    confidence = min(1.0, 0.58 * button_score + 0.42 * border_score)
-    method = "classic-title-border-anchor-v8"
+    # Keep confidence above the backend's safe-accept threshold only when both a
+    # fixed title anchor and a true full-width bottom border were found.
+    confidence = min(1.0, 0.50 + 0.25 * anchor_score + 0.25 * border_score)
+    method = "classic-white-border-anchor-v9"
     return (
         UiRegion("minimap_panel", panel_bounds, confidence, method),
         UiRegion("minimap_canvas", canvas_bounds, confidence, method),
