@@ -17,6 +17,7 @@ class Listener(Configurable):
         'Start/stop': 'insert',
         'Reload routine': 'f6',
         'Record position': 'f7',
+        'Vision debug': 'f10',
         'Emergency stop': 'f12',
     }
     BLOCK_DELAY = 1
@@ -58,8 +59,11 @@ class Listener(Configurable):
         while True:
             try:
                 emergency_key = self.config.get('Emergency stop', 'f12')
+                debug_key = self.config.get('Vision debug', 'f10')
                 if self._pressed_once(emergency_key):
                     self.emergency_stop()
+                elif self._pressed_once(debug_key):
+                    self.toggle_vision_debug()
                 elif self.enabled:
                     if self._pressed_once(self.config['Start/stop']):
                         Listener.toggle_enabled()
@@ -84,6 +88,14 @@ class Listener(Configurable):
                 print(f"\n[!] Cannot use '{action}' while Auto Maple is enabled")
                 self.block_time = now
         return False
+
+    @staticmethod
+    def toggle_vision_debug():
+        observer = getattr(config, 'scene_observer', None)
+        if observer is None:
+            print('\n[!] Vision debug unavailable: scene observer is not running')
+            return
+        observer.toggle_debug()
 
     @staticmethod
     def emergency_stop():
@@ -124,7 +136,6 @@ class Listener(Configurable):
                 release_all()
                 return
 
-            # Give the tracker a brief opportunity to find the player after calibration.
             deadline = time.monotonic() + 2.0
             while time.monotonic() < deadline and not config.capture.player_found:
                 time.sleep(0.02)
