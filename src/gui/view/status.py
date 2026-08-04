@@ -35,7 +35,7 @@ class Status(LabelFrame):
         self.nearest_monster = tk.StringVar(value='None')
         self.scene_event = tk.StringVar(value='Waiting')
         self.recorder_state = tk.StringVar(value='Idle')
-        self.recorder_counts = tk.StringVar(value='S 0 · F 0 · E 0')
+        self.recorder_counts = tk.StringVar(value='S 0 · F 0 · E 0 · 0 MB')
         self.recorder_event = tk.StringVar(value='Idle')
         self.last_error = tk.StringVar(value='None')
 
@@ -52,7 +52,7 @@ class Status(LabelFrame):
         self._add_row(10, 'Vision event:', self.scene_event, wrap=True)
         self._add_row(11, 'Recorder:', self.recorder_state)
         self._add_row(12, 'Recorded data:', self.recorder_counts)
-        self._add_row(13, 'Recorder event:', self.recorder_event, wrap=True)
+        self._add_row(13, 'Recorder report:', self.recorder_event, wrap=True)
         self._add_row(14, 'Last error:', self.last_error, wrap=True)
 
     def _add_row(self, row, label_text, variable, wrap=False):
@@ -106,18 +106,28 @@ class Status(LabelFrame):
         recording = recorder.snapshot() if recorder is not None else None
         if recording is None:
             self.recorder_state.set('Unavailable')
-            self.recorder_counts.set('S 0 · F 0 · E 0')
+            self.recorder_counts.set('S 0 · F 0 · E 0 · 0 MB')
             self.recorder_event.set('Recorder unavailable')
         else:
             if recording.recording:
                 minutes, seconds = divmod(int(recording.elapsed_seconds), 60)
-                self.recorder_state.set(f'RECORDING · {minutes:02d}:{seconds:02d}')
+                self.recorder_state.set(
+                    f'RECORDING · {minutes:02d}:{seconds:02d} · Smart'
+                )
+                self.recorder_event.set(recording.last_event)
             else:
-                self.recorder_state.set('Idle')
+                self.recorder_state.set('Idle · Smart')
+                if recording.readiness_score:
+                    self.recorder_event.set(
+                        f'Quality {recording.quality_score}% · AI {recording.readiness_score}% · '
+                        f'{recording.recommendation}'
+                    )
+                else:
+                    self.recorder_event.set(recording.last_event)
             self.recorder_counts.set(
-                f'S {recording.samples} · F {recording.frames_saved} · E {recording.events}'
+                f'S {recording.samples} · F {recording.frames_saved} · '
+                f'E {recording.events} · {recording.estimated_size_mb:.1f} MB'
             )
-            self.recorder_event.set(recording.last_event)
 
         errors = [capture.last_error]
         if scene is not None:
