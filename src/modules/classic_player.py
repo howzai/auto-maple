@@ -67,7 +67,7 @@ def _deduplicate(candidates: List[Candidate]) -> List[Candidate]:
 
 
 def install_classic_player_fallback(capture_class) -> None:
-    """Use the yellow self-marker as the authoritative, low-latency position."""
+    """Use the yellow self-marker as the authoritative, zero-lag position."""
     if getattr(capture_class, "_classic_player_patch_installed", False):
         return
 
@@ -78,7 +78,7 @@ def install_classic_player_fallback(capture_class) -> None:
 
         # Yellow is the local player. Red dots are other players and are already
         # rejected by classic_player_candidates(). Never mix yellow candidates
-        # with the legacy grayscale template, which can lock onto static scenery.
+        # with the legacy grayscale template when yellow is visible.
         if classic:
             self.player_detection_method = "classic-yellow"
             return _deduplicate(classic)
@@ -89,22 +89,13 @@ def install_classic_player_fallback(capture_class) -> None:
 
     def accept_position_fast(self, position: Point):
         if getattr(self, "player_detection_method", "") == "classic-yellow":
-            # The yellow diamond is small, unique and already shape/color filtered.
-            # Track it immediately instead of applying the old slow EMA and
-            # multi-frame teleport confirmation intended for noisy templates.
-            previous = getattr(self, "_filtered_position", None)
-            if previous is None:
-                filtered = position
-            else:
-                alpha = 0.88
-                filtered = (
-                    alpha * position[0] + (1.0 - alpha) * previous[0],
-                    alpha * position[1] + (1.0 - alpha) * previous[1],
-                )
-            self._filtered_position = filtered
+            # The yellow diamond has already passed color/shape filtering. Publish
+            # the newest coordinate directly on the same capture frame: no EMA,
+            # no teleport delay, and no multi-frame confirmation.
+            self._filtered_position = position
             self._pending_jump = None
             self._pending_jump_frames = 0
-            return filtered
+            return position
         return original_accept_position(self, position)
 
     capture_class._player_candidates = bounded_player_candidates
