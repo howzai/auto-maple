@@ -10,6 +10,7 @@ from src.modules.bot import Bot
 from src.modules.capture import Capture
 from src.modules.classic_vision_backend import install_classic_vision_backend
 from src.modules.classic_player import install_classic_player_fallback
+from src.modules.data_recorder import DataRecorder
 from src.modules.gui import GUI
 from src.modules.listener import Listener
 from src.modules.notifier import Notifier
@@ -52,12 +53,14 @@ def main():
     bot = Bot()
     capture = Capture()
     scene_observer = SceneObserver()
+    data_recorder = DataRecorder()
     notifier = Notifier()
     listener = Listener()
 
     _start_and_wait(bot, "Bot")
     _start_and_wait(capture, "Capture")
     _start_and_wait(scene_observer, "Scene Observer")
+    _start_and_wait(data_recorder, "Data Recorder")
     _start_and_wait(notifier, "Notifier")
     _start_and_wait(listener, "Listener")
 
@@ -66,6 +69,8 @@ def main():
     print("[~] Capture backend: Windows Graphics Capture")
     print("[~] Minimap vision: Classic fixed-UI geometry")
     print("[~] Main-scene vision: Observation only / optional YOLO")
+    print("[~] Press F8 to start dataset recording")
+    print("[~] Press F9 to stop dataset recording")
     print("[~] Press F10 to toggle vision debug data")
     print("[~] Press F12 at any time for emergency stop")
 
@@ -87,6 +92,12 @@ if __name__ == "__main__":
         print("\n[!] Auto Maple failed to start; see logs/auto-maple.log")
     finally:
         config.enabled = False
+        recorder = getattr(config, "data_recorder", None)
+        if recorder is not None:
+            try:
+                recorder.stop()
+            except Exception:
+                logger.exception("Data recorder shutdown failed")
         observer = getattr(config, "scene_observer", None)
         if observer is not None:
             try:
