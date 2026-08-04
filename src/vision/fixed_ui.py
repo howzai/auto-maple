@@ -2,9 +2,9 @@
 
 The minimap is anchored by fixed UI chrome, never by moving map artwork.  The
 locator finds the orange ``地圖`` button (or the pale title-bar fallback), uses
-that to determine the panel width, then scans for the first truly full-width
-bottom border.  All work is limited to a small upper-left ROI so startup remains
-fast and player-marker tracking is not delayed.
+that to determine the panel width, then scans for the OUTERMOST full-width bottom
+chrome.  Work stays inside a small upper-left ROI so startup and yellow-marker
+tracking remain fast.
 """
 
 from __future__ import annotations
@@ -70,7 +70,6 @@ def _find_map_button(roi: np.ndarray) -> Optional[Tuple[int, int, int, int, floa
     """Find the saturated orange/yellow map button in a small top-left ROI."""
     hsv = cv2.cvtColor(roi[:, :, :3], cv2.COLOR_BGR2HSV)
 
-    # Two masks cover both the deeper orange and pale yellow client variants.
     orange = cv2.inRange(
         hsv,
         np.array((5, 70, 105), dtype=np.uint8),
@@ -99,7 +98,6 @@ def _find_map_button(roi: np.ndarray) -> Optional[Tuple[int, int, int, int, floa
         aspect = w / float(max(h, 1))
         if fill < 0.24 or not 1.05 <= aspect <= 8.0:
             continue
-        # The real button is normally the rightmost compact title-bar component.
         score = 0.48 * fill + 0.22 * min(1.0, aspect / 3.0) + 0.30 * (x / roi_w)
         candidates.append((score, x, y, x + w, y + h))
 
@@ -132,7 +130,6 @@ def _find_canvas_top(gray: np.ndarray, panel_right: int, start_y: int, end_y: in
         row = gray[y:y + 1, x1:x2]
         if row.size == 0:
             continue
-        # Map canvas is predominantly dark blue/gray across most of its width.
         dark_fraction = float(np.mean(row < 155))
         if dark_fraction >= 0.68:
             if consecutive == 0:
@@ -148,30 +145,81 @@ def _find_canvas_top(gray: np.ndarray, panel_right: int, start_y: int, end_y: in
 
 def _find_bottom_border(gray: np.ndarray, panel_right: int, canvas_top: int,
                         max_y: int) -> Optional[Tuple[int, float]]:
-    """Find a continuous full-width pale border, ignoring map platforms."""
+    """Return the lowest credible full-width panel border.
+
+    The previous version returned the first bright full-width row.  Some maps have
+    a pale floor/platform across almost the entire minimap, so that row was mistaken
+    for the panel bottom and the lower part was cropped away.  We now collect all
+    credible horizontal chrome bands and choose the lowest one that is supported by
+    the left and right frame edges.
+    """
     x1 = 1
     x2 = max(x1 + 1, panel_right - 1)
+    end_y = min(max_y, gray.shape[0] - 2)
+    candidates = []
     run_start = None
-    scores = []
+    run_scores = []
 
-    for y in range(canvas_top + 28, min(max_y, gray.shape[0] - 1)):
+    for y in range(canvas_top + 28, end_y):
         row = gray[y:y + 1, x1:x2]
         if row.size == 0:
             continue
-        # A real UI border spans nearly the whole panel. Platforms and scenery do
-        # not, so require a much higher full-row light fraction than before.
         light = float(np.mean(row >= 145))
-        if light >= 0.76:
+
+        if light >= 0.72:
             if run_start is None:
                 run_start = y
-                scores = []
-            scores.append(light)
-            if len(scores) >= 2:
-                return run_start, float(np.mean(scores))
-        else:
+                run_scores = []
+            run_scores.append(light)
+        elif run_start is not None:
+            run_end = y - 1
+            run_len = run_end - run_start + 1
+            if 2 <= run_len <= 14:
+                probe_y1 = max(canvas_top, run_start - 5)
+                probe_y2 = min(gray.shape[0], run_end + 6)
+                left_edge = gray[probe_y1:probe_y2, 0:min(5, panel_right)]
+                right_edge = gray[probe_y1:probe_y2, max(0, panel_right - 5):panel_right]
+                left_support = float(np.mean(left_edge >= 125)) if left_edge.size else 0.0
+                right_support = float(np.mean(right_edge >= 125)) if right_edge.size else 0.0
+
+                # Real panel chrome meets both vertical borders.  Map artwork may
+                # span most of the width but normally does not terminate into both
+                # pale frame edges at the same row.
+                if left_support >= 0.20 and right_support >= 0.20:
+                    score = (
+                        0.60 * float(np.mean(run_scores))
+                        + 0.20 * left_support
+                        + 0.20 * right_support
+                    )
+                    candidates.append((run_start, score))
             run_start = None
-            scores = []
-    return None
+            run_scores = []
+
+    # Flush a run that reaches the end of the search area.
+    if run_start is not None:
+        run_end = end_y - 1
+        run_len = run_end - run_start + 1
+        if 2 <= run_len <= 14:
+            probe_y1 = max(canvas_top, run_start - 5)
+            probe_y2 = min(gray.shape[0], run_end + 6)
+            left_edge = gray[probe_y1:probe_y2, 0:min(5, panel_right)]
+            right_edge = gray[probe_y1:probe_y2, max(0, panel_right - 5):panel_right]
+            left_support = float(np.mean(left_edge >= 125)) if left_edge.size else 0.0
+            right_support = float(np.mean(right_edge >= 125)) if right_edge.size else 0.0
+            if left_support >= 0.20 and right_support >= 0.20:
+                score = (
+                    0.60 * float(np.mean(run_scores))
+                    + 0.20 * left_support
+                    + 0.20 * right_support
+                )
+                candidates.append((run_start, score))
+
+    if not candidates:
+        return None
+
+    # Choose the OUTERMOST supported border.  This is the key difference from v9.
+    border_y, score = max(candidates, key=lambda item: item[0])
+    return border_y, float(score)
 
 
 def _locate_minimap(frame: np.ndarray) -> Optional[Tuple[UiRegion, UiRegion]]:
@@ -180,7 +228,7 @@ def _locate_minimap(frame: np.ndarray) -> Optional[Tuple[UiRegion, UiRegion]]:
         return None
 
     search_w = min(width, max(260, int(width * 0.25)))
-    search_h = min(height, max(220, int(height * 0.48)))
+    search_h = min(height, max(240, int(height * 0.52)))
     roi = frame[:search_h, :search_w, :3]
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
 
@@ -220,10 +268,10 @@ def _locate_minimap(frame: np.ndarray) -> Optional[Tuple[UiRegion, UiRegion]]:
         return None
     border_y, border_score = bottom
 
-    panel_bottom = min(height, border_y + 8)
+    panel_bottom = min(height, border_y + 9)
     canvas_bounds = _clip_bounds(
         frame,
-        ((4, canvas_top), (panel_right - 5, max(canvas_top + 1, border_y - 2))),
+        ((4, canvas_top), (panel_right - 5, max(canvas_top + 1, border_y - 1))),
     )
     panel_bounds = _clip_bounds(
         frame,
@@ -237,13 +285,11 @@ def _locate_minimap(frame: np.ndarray) -> Optional[Tuple[UiRegion, UiRegion]]:
     if canvas_w < 90 or canvas_h < 30:
         return None
     ratio = canvas_w / float(max(canvas_h, 1))
-    if not 0.50 <= ratio <= 7.0:
+    if not 0.45 <= ratio <= 7.0:
         return None
 
-    # Keep confidence above the backend's safe-accept threshold only when both a
-    # fixed title anchor and a true full-width bottom border were found.
     confidence = min(1.0, 0.50 + 0.25 * anchor_score + 0.25 * border_score)
-    method = "classic-white-border-anchor-v9"
+    method = "classic-outer-border-anchor-v10"
     return (
         UiRegion("minimap_panel", panel_bounds, confidence, method),
         UiRegion("minimap_canvas", canvas_bounds, confidence, method),
