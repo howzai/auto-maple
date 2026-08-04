@@ -17,7 +17,7 @@ class GUI:
     DISPLAY_FRAME_RATE = 30
     HEALTH_REFRESH_MS = 250
     RESOLUTIONS = {
-        'DEFAULT': '800x860',
+        'DEFAULT': '800x1010',
         'Edit': '1400x800',
     }
 
@@ -110,6 +110,9 @@ class GUI:
     def _on_close(self):
         self._closing = True
         config.enabled = False
+        observer = getattr(config, 'scene_observer', None)
+        if observer is not None and hasattr(observer, 'stop'):
+            observer.stop()
         capture = getattr(config, 'capture', None)
         if capture is not None and hasattr(capture, 'stop'):
             capture.stop()
