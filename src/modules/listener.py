@@ -10,6 +10,7 @@ import keyboard as kb
 from src.common import config, utils
 from src.common.interfaces import Configurable
 from src.common.vkeys import release_all
+from src.modules.manual_minimap_roi import select_search_region
 
 
 class Listener(Configurable):
@@ -20,6 +21,7 @@ class Listener(Configurable):
         'Start recording': 'f8',
         'Stop recording': 'f9',
         'Vision debug': 'f10',
+        'Calibrate minimap': 'f11',
         'Emergency stop': 'f12',
     }
     BLOCK_DELAY = 1
@@ -79,6 +81,7 @@ class Listener(Configurable):
                 record_start_key = self._configured_key('Start recording')
                 record_stop_key = self._configured_key('Stop recording')
                 debug_key = self._configured_key('Vision debug')
+                calibrate_key = self._configured_key('Calibrate minimap')
                 if self._pressed_once(emergency_key):
                     self.emergency_stop()
                 elif self._pressed_once(record_start_key):
@@ -87,6 +90,8 @@ class Listener(Configurable):
                     self.stop_recording()
                 elif self._pressed_once(debug_key):
                     self.toggle_vision_debug()
+                elif self._pressed_once(calibrate_key):
+                    self.calibrate_minimap_region()
                 elif self.enabled:
                     if self._pressed_once(self._configured_key('Start/stop')):
                         Listener.toggle_enabled()
@@ -136,6 +141,33 @@ class Listener(Configurable):
             print('\n[!] Vision debug unavailable: scene observer is not running')
             return
         observer.toggle_debug()
+
+    @staticmethod
+    def calibrate_minimap_region():
+        capture = getattr(config, 'capture', None)
+        if capture is None:
+            print('\n[!] Minimap calibration unavailable: capture service is not running')
+            return
+        was_enabled = config.enabled
+        config.enabled = False
+        release_all()
+        recorder = getattr(config, 'data_recorder', None)
+        if recorder is not None and getattr(recorder, 'recording', False):
+            recorder.stop_session()
+        try:
+            if select_search_region(capture):
+                deadline = time.monotonic() + 3.0
+                while time.monotonic() < deadline and not capture.calibrated:
+                    time.sleep(0.02)
+                if capture.calibrated:
+                    print('\n[~] F11 minimap calibration applied successfully')
+                else:
+                    print('\n[!] Saved F11 region, but minimap canvas was not detected yet')
+        finally:
+            # Do not automatically re-enable automation after an interactive ROI
+            # change.  The user can resume explicitly after visually confirming it.
+            if was_enabled:
+                print('\n[~] Automation remains paused after F11 calibration; press Insert to resume when ready')
 
     @staticmethod
     def emergency_stop():
