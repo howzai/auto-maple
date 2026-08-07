@@ -10,6 +10,7 @@ from typing import Optional, Tuple
 import numpy as np
 
 from src.vision.fixed_ui import FixedUiSnapshot, locate_fixed_ui
+from src.modules.classic_minimap import find_classic_minimap
 
 
 Bounds = Tuple[Tuple[int, int], Tuple[int, int]]
@@ -42,8 +43,12 @@ def _load_yolo():
         return _MODEL
     _MODEL_ATTEMPTED = True
 
-    weights = _project_root() / "assets" / "models" / "classic_maple.pt"
-    if not weights.is_file():
+    candidates = (
+        _project_root() / "assets" / "models" / "classic_scene.pt",
+        _project_root() / "assets" / "models" / "classic_maple.pt",
+    )
+    weights = next((path for path in candidates if path.is_file()), None)
+    if weights is None:
         return None
 
     try:
@@ -65,9 +70,9 @@ def _valid(frame: np.ndarray, bounds: Bounds) -> bool:
         and 0 <= y1 < y2 <= height
         and x1 <= max(90, int(width * 0.10))
         and y1 <= max(90, int(height * 0.14))
-        and 110 <= crop_width <= max(380, int(width * 0.36))
-        and 38 <= crop_height <= max(320, int(height * 0.42))
-        and 0.72 <= crop_width / max(crop_height, 1) <= 5.5
+        and 90 <= crop_width <= max(430, int(width * 0.36))
+        and 30 <= crop_height <= max(340, int(height * 0.44))
+        and 0.45 <= crop_width / max(crop_height, 1) <= 7.0
     )
 
 
@@ -100,12 +105,26 @@ def _find_with_yolo(frame: np.ndarray) -> Optional[Located]:
 
 
 def locate_classic_minimap(frame: np.ndarray) -> Optional[Tuple[Located, Optional[FixedUiSnapshot]]]:
+    """Locate the minimap using multiple independent strategies.
+
+    Fixed UI geometry is the preferred fast path.  If it misses on a particular
+    map layout, fall back to the older contour/anchored detector that was already
+    proven to work on the classic client.  YOLO remains a final optional fallback.
+    """
     snapshot = locate_fixed_ui(frame)
     if snapshot is not None:
         region = snapshot.minimap_canvas
         located = (region.bounds, region.confidence, region.method)
         if region.confidence >= MIN_ACCEPTED_SCORE and _valid(frame, region.bounds):
             return located, snapshot
+
+    legacy = find_classic_minimap(frame)
+    if legacy is not None:
+        bounds, score, method = legacy
+        if _valid(frame, bounds):
+            # Legacy detector uses a different confidence scale; its own function
+            # already rejects unsafe candidates, so do not impose v10's threshold.
+            return (bounds, float(score), f"{method}-fallback"), None
 
     yolo = _find_with_yolo(frame)
     if yolo is not None and yolo[1] >= MIN_ACCEPTED_SCORE:
@@ -267,8 +286,6 @@ def install_classic_vision_backend(capture_class) -> None:
         if not ok or self.frame is None:
             return ok
 
-        # The GUI previously kept showing the one-time calibration sample.
-        # Publish the newly cropped minimap every frame before any slower relocalization.
         _publish_live_minimap(self)
 
         now = time.monotonic()
