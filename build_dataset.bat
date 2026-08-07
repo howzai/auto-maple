@@ -1,31 +1,52 @@
 @echo off
-setlocal
-cd /d "%~dp0"
+setlocal EnableExtensions
+set "ROOT=%~dp0"
+pushd "%ROOT%" >nul 2>&1
+if errorlevel 1 goto :badroot
 
-if not exist ".venv\Scripts\python.exe" (
-    echo [!] 找不到 .venv，請先執行 setup_wgc.bat
-    pause
-    exit /b 1
-)
+set "PY=.venv\Scripts\python.exe"
+if not exist "%PY%" goto :nopython
+if not exist "tools\build_dataset.py" goto :notool
 
 echo.
 echo ========================================
 echo   Auto Maple Dataset Manager
 echo ========================================
 echo.
-echo 將掃描 datasets\session_*，略過低品質資料並去除近似重複圖片。
-echo 原始 Session 不會被刪除或修改。
+echo Scanning datasets\session_* ...
+echo Source sessions will NOT be modified.
 echo.
 
-".venv\Scripts\python.exe" tools\build_dataset.py
-set "EXIT_CODE=%ERRORLEVEL%"
-
+"%PY%" "tools\build_dataset.py"
+set "RC=%ERRORLEVEL%"
 echo.
-if "%EXIT_CODE%"=="0" (
-    echo [OK] 完成。請查看 training_dataset 資料夾。
-) else (
-    echo [!] 建立失敗，錯誤碼：%EXIT_CODE%
-)
+if not "%RC%"=="0" goto :failed
+echo [OK] Dataset build completed.
+echo [OK] Output: training_dataset
+goto :done
+
+:nopython
+echo [ERROR] Python virtual environment was not found.
+echo Run setup_wgc.bat first.
+set "RC=1"
+goto :done
+
+:notool
+echo [ERROR] tools\build_dataset.py was not found.
+set "RC=1"
+goto :done
+
+:badroot
+echo [ERROR] Could not open the project directory.
+set "RC=1"
+goto :finish
+
+:failed
+echo [ERROR] Dataset build failed. Error code: %RC%
+
+:done
+popd >nul 2>&1
+:finish
 echo.
 pause
-exit /b %EXIT_CODE%
+exit /b %RC%
