@@ -97,7 +97,7 @@ def prepare_monster_bootstrap(dataset: Path, seed: int = 20260807) -> tuple[Path
         "train": items[val_count:],
     }
 
-    output = dataset / "monster_bootstrap"
+    output = (dataset / "monster_bootstrap").resolve()
     if output.exists():
         shutil.rmtree(output)
 
@@ -117,8 +117,13 @@ def prepare_monster_bootstrap(dataset: Path, seed: int = 20260807) -> tuple[Path
             _write_lines(labels_out / f"{image_path.stem}.txt", lines)
 
     yaml_path = output / "data.yaml"
+    # Ultralytics may resolve a relative `path: .` against the process working
+    # directory instead of this YAML file on some Windows versions.  Use the
+    # absolute bootstrap directory so images/train and images/val always resolve
+    # to the dataset we just created.
+    yaml_root = output.as_posix().replace("'", "''")
     yaml_path.write_text(
-        "path: .\n"
+        f"path: '{yaml_root}'\n"
         "train: images/train\n"
         "val: images/val\n"
         "names:\n"
@@ -169,8 +174,6 @@ def main() -> int:
         except RuntimeError as exc:
             print(f"[ERROR] {exc}")
             return 2
-        # 80 reviewed frames are enough for a useful smoke-test model.  More data
-        # will improve it, but we deliberately allow early iteration.
         if reviewed < 60 or boxes < 60:
             print(f"[ERROR] Monster bootstrap needs at least 60 reviewed images / 60 monster boxes.")
             print(f"[ERROR] Current: {reviewed} reviewed images / {boxes} monster boxes.")
@@ -202,6 +205,7 @@ def main() -> int:
     print(f"Mode: {data_description}")
     print(f"Positive labeled images: {labeled_files}")
     print(f"Monster/YOLO boxes: {boxes}")
+    print(f"Training YAML: {yaml_path}")
     print(f"Base model: {args.base_model}")
     print(f"Epochs: {args.epochs}")
     print(f"Image size: {args.imgsz}")
@@ -209,7 +213,7 @@ def main() -> int:
 
     model = YOLO(args.base_model)
     train_kwargs = {
-        "data": str(yaml_path),
+        "data": str(yaml_path.resolve()),
         "epochs": max(1, args.epochs),
         "imgsz": max(320, args.imgsz),
         "batch": args.batch,
