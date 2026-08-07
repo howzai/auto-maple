@@ -1,0 +1,2 @@
+# Optional dependencies for training the classic scene detector.
+ultralytics>=8.3,<9
