@@ -14,6 +14,9 @@ Controls:
     Delete/Backspace: delete selected box
     Ctrl+S: save current labels
     Space: save and go to next image
+
+The tool remembers the last image for each split and autosaves after box edits, so
+long manual-labeling sessions can be safely stopped and resumed.
 """
 
 from __future__ import annotations
@@ -58,6 +61,7 @@ class LabelApp:
         self.images_dir = dataset_root / "images" / split
         self.labels_dir = dataset_root / "labels" / split
         self.labels_dir.mkdir(parents=True, exist_ok=True)
+        self.progress_path = dataset_root / f".labeler_progress_{split}.txt"
 
         self.images = sorted(
             path for path in self.images_dir.iterdir()
@@ -66,8 +70,8 @@ class LabelApp:
         if not self.images:
             raise FileNotFoundError(f"No images found in {self.images_dir}")
 
-        self.index = 0
-        self.class_id = 1
+        self.index = self._load_progress()
+        self.class_id = 1  # Monster-first workflow.
         self.boxes: List[Box] = []
         self.selected_index: Optional[int] = None
         self.start_point: Optional[Tuple[float, float]] = None
@@ -114,6 +118,19 @@ class LabelApp:
         self.set_class(self.class_id)
         self.load_current()
 
+    def _load_progress(self) -> int:
+        try:
+            value = int(self.progress_path.read_text(encoding="utf-8").strip())
+        except Exception:
+            return 0
+        return min(max(0, value), max(0, len(self.images) - 1))
+
+    def _save_progress(self):
+        try:
+            self.progress_path.write_text(str(self.index), encoding="utf-8")
+        except OSError:
+            pass
+
     def set_class(self, class_id: int):
         self.class_id = class_id
         self.class_label.set(f"Class {class_id}: {CLASSES[class_id]}")
@@ -125,6 +142,7 @@ class LabelApp:
         return self.labels_dir / f"{self.current_image_path().stem}.txt"
 
     def load_current(self):
+        self._save_progress()
         self.image = Image.open(self.current_image_path()).convert("RGB")
         self.boxes = []
         label_path = self.current_label_path()
@@ -147,9 +165,12 @@ class LabelApp:
         self.render()
 
     def update_status(self):
+        reviewed = sum(1 for image in self.images if (self.labels_dir / f"{image.stem}.txt").exists())
+        monster_boxes = sum(1 for box in self.boxes if box.class_id == 1)
         self.status.set(
             f"{self.split}  {self.index + 1}/{len(self.images)}  "
-            f"{self.current_image_path().name}  Boxes: {len(self.boxes)}  "
+            f"Reviewed files: {reviewed}  {self.current_image_path().name}  "
+            f"Boxes: {len(self.boxes)} (monster {monster_boxes})  "
             "[1-5 class | drag add | right-click select | Del remove | Space save+next]"
         )
 
@@ -212,6 +233,7 @@ class LabelApp:
         if abs(x2 - x1) >= 4 and abs(y2 - y1) >= 4:
             self.boxes.append(Box(self.class_id, x1, y1, x2, y2))
             self.selected_index = len(self.boxes) - 1
+            self.save_labels()  # Autosave immediately after every new box.
         self.update_status()
         self.render()
 
@@ -224,7 +246,6 @@ class LabelApp:
             top, bottom = sorted((box.y1, box.y2))
             if left <= px <= right and top <= py <= bottom:
                 self.selected_index = i
-                self.class_id = box.class_id
                 self.set_class(box.class_id)
                 break
         self.render()
@@ -233,10 +254,13 @@ class LabelApp:
         if self.selected_index is not None and 0 <= self.selected_index < len(self.boxes):
             del self.boxes[self.selected_index]
             self.selected_index = None
+            self.save_labels()
             self.update_status()
             self.render()
 
     def save_labels(self):
+        if self.image is None:
+            return
         width, height = self.image.size
         lines = []
         for box in self.boxes:
@@ -245,6 +269,7 @@ class LabelApp:
                 continue
             lines.append(f"{box.class_id} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
         self.current_label_path().write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+        self._save_progress()
         self.update_status()
 
     def previous(self):
@@ -263,6 +288,7 @@ class LabelApp:
 
     def on_close(self):
         self.save_labels()
+        self._save_progress()
         self.root.destroy()
 
 
