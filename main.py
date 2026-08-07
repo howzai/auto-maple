@@ -67,11 +67,12 @@ def main():
     logger.info("Successfully initialized Auto Maple")
     print("\n[~] Successfully initialized Auto Maple")
     print("[~] Capture backend: Windows Graphics Capture")
-    print("[~] Minimap vision: Classic fixed-UI geometry")
+    print("[~] Minimap vision: Classic fixed-UI geometry / F11 manual search region")
     print("[~] Main-scene vision: Observation only / optional YOLO")
     print("[~] Press F8 to start dataset recording")
     print("[~] Press F9 to stop dataset recording")
     print("[~] Press F10 to toggle vision debug data")
+    print("[~] Press F11 to draw/save the minimap search region")
     print("[~] Press F12 at any time for emergency stop")
 
     gui = GUI()
