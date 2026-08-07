@@ -9,8 +9,9 @@ from typing import Optional, Tuple
 
 import numpy as np
 
-from src.vision.fixed_ui import FixedUiSnapshot, locate_fixed_ui
 from src.modules.classic_minimap import find_classic_minimap
+from src.modules.manual_minimap_roi import load_search_region
+from src.vision.fixed_ui import FixedUiSnapshot, locate_fixed_ui
 
 
 Bounds = Tuple[Tuple[int, int], Tuple[int, int]]
@@ -19,21 +20,18 @@ Located = Tuple[Bounds, float, str]
 _MODEL = None
 _MODEL_ATTEMPTED = False
 
-# Normal background relocalization stays conservative so moving minimap artwork
-# cannot make the ROI jump.  When the player marker disappears after a map change,
-# a separate fast recovery path temporarily scans more often and accepts a stable
-# upper-left anchored resize after two confirmations.
 RELOCALIZE_INTERVAL_SECONDS = 2.0
 RELOCALIZE_CONFIRMATIONS = 3
 RELOCALIZE_CLUSTER_TOLERANCE = 8
 MAX_SINGLE_STEP_PIXELS = 28
 MAX_SIZE_CHANGE_RATIO = 0.22
 
-MAP_CHANGE_PLAYER_LOST_SECONDS = 0.55
-MAP_CHANGE_SCAN_INTERVAL_SECONDS = 0.20
+# Fast recovery is intentionally aggressive only after startup has already locked.
+MAP_CHANGE_PLAYER_LOST_SECONDS = 0.45
+MAP_CHANGE_SCAN_INTERVAL_SECONDS = 0.12
 MAP_CHANGE_CONFIRMATIONS = 2
-MAP_CHANGE_TOP_LEFT_TOLERANCE = 28
-MAP_CHANGE_MAX_PENDING_SECONDS = 2.0
+MAP_CHANGE_TOP_LEFT_TOLERANCE = 34
+MAP_CHANGE_MAX_PENDING_SECONDS = 1.5
 
 ANCHORED_RESIZE_TOP_LEFT_TOLERANCE = 18
 ANCHORED_RESIZE_MAX_WIDTH_RATIO = 1.35
@@ -76,12 +74,54 @@ def _valid(frame: np.ndarray, bounds: Bounds) -> bool:
     return (
         0 <= x1 < x2 <= width
         and 0 <= y1 < y2 <= height
-        and x1 <= max(90, int(width * 0.10))
-        and y1 <= max(90, int(height * 0.14))
-        and 90 <= crop_width <= max(430, int(width * 0.36))
-        and 30 <= crop_height <= max(340, int(height * 0.44))
-        and 0.45 <= crop_width / max(crop_height, 1) <= 7.0
+        and x1 <= max(100, int(width * 0.12))
+        and y1 <= max(110, int(height * 0.16))
+        and 90 <= crop_width <= max(460, int(width * 0.38))
+        and 30 <= crop_height <= max(360, int(height * 0.46))
+        and 0.40 <= crop_width / max(crop_height, 1) <= 7.5
     )
+
+
+def _translate(bounds: Bounds, ox: int, oy: int) -> Bounds:
+    return (
+        (bounds[0][0] + ox, bounds[0][1] + oy),
+        (bounds[1][0] + ox, bounds[1][1] + oy),
+    )
+
+
+def _find_in_manual_region(frame: np.ndarray) -> Optional[Located]:
+    """Fast path: search only the user-selected F11 rectangle."""
+    region = load_search_region(frame)
+    if region is None:
+        return None
+    (x1, y1), (x2, y2) = region
+    crop = frame[y1:y2, x1:x2]
+    if crop.size == 0:
+        return None
+
+    # The legacy contour detector is excellent once the search area has already
+    # been constrained by the user.  Translate its local coordinates back to the
+    # WGC game frame.
+    legacy = find_classic_minimap(crop)
+    if legacy is not None:
+        local_bounds, score, method = legacy
+        bounds = _translate(local_bounds, x1, y1)
+        if _valid(frame, bounds):
+            return bounds, float(score), f"manual-{method}"
+
+    # If the user drew a tight box and contour detection misses transiently,
+    # derive a conservative canvas from the selected panel.  This is only a
+    # temporary fallback; normal relocalization will replace it when available.
+    rw, rh = x2 - x1, y2 - y1
+    if rw >= 150 and rh >= 110:
+        left = x1 + max(3, int(rw * 0.02))
+        right = x2 - max(3, int(rw * 0.03))
+        top = y1 + max(42, int(rh * 0.34))
+        bottom = y2 - max(8, int(rh * 0.08))
+        bounds = ((left, top), (right, bottom))
+        if _valid(frame, bounds):
+            return bounds, 0.50, "manual-box-fallback"
+    return None
 
 
 def _find_with_yolo(frame: np.ndarray) -> Optional[Located]:
@@ -113,7 +153,11 @@ def _find_with_yolo(frame: np.ndarray) -> Optional[Located]:
 
 
 def locate_classic_minimap(frame: np.ndarray) -> Optional[Tuple[Located, Optional[FixedUiSnapshot]]]:
-    """Locate the minimap using multiple independent strategies."""
+    """Locate the minimap, preferring the persistent F11 user search region."""
+    manual = _find_in_manual_region(frame)
+    if manual is not None:
+        return manual, None
+
     snapshot = locate_fixed_ui(frame)
     if snapshot is not None:
         region = snapshot.minimap_canvas
@@ -171,12 +215,8 @@ def _plausible_transition(old_bounds: Bounds, new_bounds: Bounds) -> bool:
         width_scale = new_width / max(old_width, 1)
         height_scale = new_height / max(old_height, 1)
         return (
-            1.0 / ANCHORED_RESIZE_MAX_WIDTH_RATIO
-            <= width_scale
-            <= ANCHORED_RESIZE_MAX_WIDTH_RATIO
-            and 1.0 / ANCHORED_RESIZE_MAX_HEIGHT_RATIO
-            <= height_scale
-            <= ANCHORED_RESIZE_MAX_HEIGHT_RATIO
+            1.0 / ANCHORED_RESIZE_MAX_WIDTH_RATIO <= width_scale <= ANCHORED_RESIZE_MAX_WIDTH_RATIO
+            and 1.0 / ANCHORED_RESIZE_MAX_HEIGHT_RATIO <= height_scale <= ANCHORED_RESIZE_MAX_HEIGHT_RATIO
         )
     return False
 
@@ -216,7 +256,7 @@ def _clear_pending(self) -> None:
 
 
 def _apply_location(self, frame, located, ui_snapshot, reset_tracking: bool) -> bool:
-    (top_left, bottom_right), score, method = located
+    (top_left, bottom_right), _score, method = located
     if not _valid(frame, (top_left, bottom_right)):
         return False
 
@@ -273,7 +313,6 @@ def _confirm_candidate(self, new_bounds: Bounds, confirmations: int) -> bool:
 
 
 def _fast_map_change_recovery(self, frame: np.ndarray) -> bool:
-    """Relock only after startup has succeeded and a map transition is suspected."""
     if not getattr(self, "_classic_ever_locked", False):
         return False
 
@@ -291,14 +330,14 @@ def _fast_map_change_recovery(self, frame: np.ndarray) -> bool:
     new_bounds = located[0]
     old_bounds = (self._minimap_tl, self._minimap_br)
 
-    # During a real map change the classic minimap remains attached to the same
-    # upper-left UI anchor while its width/height can change dramatically.  That
-    # is safe to accept after two stable observations even when the normal
-    # transition limiter would reject the resize.
     if _bounds_distance(old_bounds, new_bounds) <= RELOCALIZE_CLUSTER_TOLERANCE:
         _clear_pending(self)
         return False
-    if _top_left_distance(old_bounds, new_bounds) > MAP_CHANGE_TOP_LEFT_TOLERANCE:
+
+    # With an F11 search region, a map resize is trusted primarily because the
+    # user has already constrained the only place a minimap is allowed to exist.
+    manual_active = load_search_region(frame) is not None
+    if not manual_active and _top_left_distance(old_bounds, new_bounds) > MAP_CHANGE_TOP_LEFT_TOLERANCE:
         _clear_pending(self)
         return False
     if not _confirm_candidate(self, new_bounds, MAP_CHANGE_CONFIRMATIONS):
@@ -308,10 +347,7 @@ def _fast_map_change_recovery(self, frame: np.ndarray) -> bool:
         (x1, y1), (x2, y2) = new_bounds
         self._classic_last_relocalize = now
         _clear_pending(self)
-        print(
-            "\n[~] Map change detected; minimap ROI recovered "
-            f"to ({x1},{y1})-({x2},{y2})"
-        )
+        print(f"\n[~] Map change detected; minimap ROI recovered to ({x1},{y1})-({x2},{y2})")
         return True
     return False
 
@@ -327,14 +363,13 @@ def install_classic_vision_backend(capture_class) -> None:
         frame = self.screenshot(delay=0)
         if frame is None:
             return False
-
         _publish_frame_heartbeat(self, frame)
 
         result = locate_classic_minimap(frame)
         if result is None:
             self.last_error = (
-                "Classic minimap not found safely. Keep the minimap expanded and "
-                "leave the game window at its normal size."
+                "Classic minimap not found safely. Press F11 and draw a box around "
+                "the whole minimap panel, or keep the minimap expanded."
             )
             return False
 
@@ -351,17 +386,13 @@ def install_classic_vision_backend(capture_class) -> None:
         _clear_pending(self)
         print(
             f"\n[~] Classic minimap locked using {method} "
-            f"(score {score:.2f}, {x2 - x1}x{y2 - y1}, "
-            f"bounds=({x1},{y1})-({x2},{y2}))"
+            f"(score {score:.2f}, {x2 - x1}x{y2 - y1}, bounds=({x1},{y1})-({x2},{y2}))"
         )
         return True
 
     def capture_and_track_with_stable_roi(self) -> bool:
         ok = original_capture_and_track(self)
 
-        # If the old ROI became invalid during a map transition, the upstream
-        # tracker can return False before normal relocalization runs.  Only after
-        # at least one successful lock do we take a fresh WGC frame and recover.
         if not ok:
             if getattr(self, "_classic_ever_locked", False):
                 frame = self.screenshot(delay=0)
@@ -377,10 +408,6 @@ def install_classic_vision_backend(capture_class) -> None:
         _publish_live_minimap(self)
         now = time.monotonic()
 
-        # Losing the yellow player marker for a short continuous interval is the
-        # strongest cheap signal that the old minimap crop now points at the wrong
-        # canvas after changing maps.  Recovery is fast, but only exists after the
-        # initial startup lock, so it cannot regress startup calibration.
         if getattr(self, "player_found", False):
             self._classic_player_missing_since = 0.0
         else:
@@ -409,20 +436,15 @@ def install_classic_vision_backend(capture_class) -> None:
         if _bounds_distance(old_bounds, new_bounds) <= RELOCALIZE_CLUSTER_TOLERANCE:
             _clear_pending(self)
             return ok
-
-        if not _plausible_transition(old_bounds, new_bounds):
+        if not _plausible_transition(old_bounds, new_bounds) and load_search_region(self.frame) is None:
             _clear_pending(self)
             return ok
-
         if not _confirm_candidate(self, new_bounds, RELOCALIZE_CONFIRMATIONS):
             return ok
 
         if _apply_location(self, self.frame, located, ui_snapshot, reset_tracking=True):
             (x1, y1), (x2, y2) = new_bounds
-            print(
-                "\n[~] Confirmed minimap layout change; ROI relocked "
-                f"to ({x1},{y1})-({x2},{y2})"
-            )
+            print(f"\n[~] Confirmed minimap layout change; ROI relocked to ({x1},{y1})-({x2},{y2})")
 
         _clear_pending(self)
         return ok
