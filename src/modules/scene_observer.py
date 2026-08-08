@@ -1,9 +1,8 @@
 """Non-blocking main-scene observation for the classic client.
 
-This first phase is deliberately observation-only: it never presses game keys.
-It reads the latest WGC frame published by Capture on its own worker thread,
-excludes fixed UI regions, optionally runs a trained YOLO scene model, and
-publishes immutable diagnostics for the GUI and future event recording.
+This phase is observation-only: it never presses game keys. It reads the latest WGC
+frame, runs the trained classic_scene.pt detector, publishes diagnostics for the GUI,
+and can show a live F10 debug preview with YOLO boxes.
 """
 
 from __future__ import annotations
@@ -58,6 +57,7 @@ class SceneObserver:
     TARGET_FPS = 10
     FRAME_INTERVAL = 1.0 / TARGET_FPS
     MODEL_FILENAME = "classic_scene.pt"
+    DEBUG_WINDOW = "Auto Maple AI - Monster Vision (F10 to close)"
     CLASS_ALIASES: Dict[str, str] = {
         "character": "player",
         "hero": "player",
@@ -80,6 +80,7 @@ class SceneObserver:
         self._last_source_frame_id = -1
         self._snapshot = SceneSnapshot()
         self._debug_frame: Optional[np.ndarray] = None
+        self._debug_window_open = False
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
         self.thread = threading.Thread(
@@ -94,6 +95,7 @@ class SceneObserver:
 
     def stop(self):
         self._stop_event.set()
+        self._close_debug_window()
 
     def snapshot(self) -> SceneSnapshot:
         with self._lock:
@@ -108,7 +110,10 @@ class SceneObserver:
         if not self.debug_enabled:
             with self._lock:
                 self._debug_frame = None
+            self._close_debug_window()
         print(f"\n[~] Vision debug {'enabled' if self.debug_enabled else 'disabled'}")
+        if self.debug_enabled:
+            print("[~] Live monster preview will open when the next WGC frame is processed")
         return self.debug_enabled
 
     @staticmethod
@@ -126,8 +131,10 @@ class SceneObserver:
         try:
             from ultralytics import YOLO
 
+            print(f"\n[~] Loading scene model: {weights}")
             self._model = YOLO(str(weights))
             self._model_status = "ready"
+            print("[~] Scene model ready: classic_scene.pt")
         except Exception as exc:
             self._model_status = "load-error"
             self.last_error = f"Scene model load failed: {exc}"
@@ -203,24 +210,72 @@ class SceneObserver:
         return direction, distance
 
     @staticmethod
-    def _draw_debug(frame: np.ndarray, detections: List[SceneDetection], bounds: Box) -> np.ndarray:
+    def _draw_debug(
+        frame: np.ndarray,
+        detections: List[SceneDetection],
+        bounds: Box,
+        inference_ms: float,
+        model_status: str,
+    ) -> np.ndarray:
         debug = frame[:, :, :3].copy()
         x1, y1, x2, y2 = bounds
         cv2.rectangle(debug, (x1, y1), (x2, y2), (255, 255, 255), 1)
+
+        monsters = 0
         for item in detections:
             bx1, by1, bx2, by2 = item.box
+            if item.label == "monster":
+                monsters += 1
             cv2.rectangle(debug, (bx1, by1), (bx2, by2), (255, 255, 255), 2)
             cv2.putText(
                 debug,
-                f"{item.label} {item.confidence:.2f}",
-                (bx1, max(18, by1 - 5)),
+                f"{item.label} {item.confidence * 100:.0f}%",
+                (bx1, max(20, by1 - 6)),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
+                0.55,
                 (255, 255, 255),
-                1,
+                2,
                 cv2.LINE_AA,
             )
+
+        hud = f"AI: {model_status}   Monsters: {monsters}   Inference: {inference_ms:.1f} ms"
+        cv2.rectangle(debug, (8, 8), (min(debug.shape[1] - 8, 590), 42), (0, 0, 0), -1)
+        cv2.putText(
+            debug,
+            hud,
+            (18, 32),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.62,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
         return debug
+
+    def _show_debug_window(self, debug: np.ndarray) -> None:
+        try:
+            if not self._debug_window_open:
+                cv2.namedWindow(self.DEBUG_WINDOW, cv2.WINDOW_NORMAL)
+                height, width = debug.shape[:2]
+                target_width = min(1280, width)
+                target_height = max(360, int(height * (target_width / max(1, width))))
+                cv2.resizeWindow(self.DEBUG_WINDOW, target_width, target_height)
+                self._debug_window_open = True
+            cv2.imshow(self.DEBUG_WINDOW, debug)
+            cv2.waitKey(1)
+        except cv2.error as exc:
+            self.last_error = f"Vision preview error: {exc}"
+            self._debug_window_open = False
+
+    def _close_debug_window(self) -> None:
+        if not self._debug_window_open:
+            return
+        try:
+            cv2.destroyWindow(self.DEBUG_WINDOW)
+            cv2.waitKey(1)
+        except cv2.error:
+            pass
+        self._debug_window_open = False
 
     def _observe_once(self) -> None:
         capture = getattr(config, "capture", None)
@@ -246,8 +301,8 @@ class SceneObserver:
 
         if self._model_status == "model-not-trained":
             event = "Scene model not trained; capture pipeline is ready"
-        elif player is None:
-            event = "Waiting for player detection"
+        elif self._model_status != "ready":
+            event = f"Scene model status: {self._model_status}"
         elif monsters:
             event = f"Tracking {len(monsters)} monster(s)"
         else:
@@ -268,7 +323,14 @@ class SceneObserver:
             last_event=event,
             last_error=self.last_error,
         )
-        debug = self._draw_debug(frame, detections, bounds) if self.debug_enabled else None
+
+        debug = None
+        if self.debug_enabled:
+            debug = self._draw_debug(frame, detections, bounds, inference_ms, self._model_status)
+            self._show_debug_window(debug)
+        elif self._debug_window_open:
+            self._close_debug_window()
+
         with self._lock:
             self._snapshot = snapshot
             self._debug_frame = debug
@@ -296,3 +358,5 @@ class SceneObserver:
             remaining = self.FRAME_INTERVAL - (time.perf_counter() - started)
             if remaining > 0:
                 time.sleep(remaining)
+
+        self._close_debug_window()
