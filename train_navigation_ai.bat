@@ -9,7 +9,7 @@ if not exist "%PY%" goto :nopython
 if not exist "tools\train_navigation.py" goto :notool
 if not exist "training_dataset\data.yaml" goto :nodataset
 
-"%PY%" -c "import ultralytics" >nul 2>&1
+"%PY%" -c "import ultralytics, torch" >nul 2>&1
 if errorlevel 1 goto :noyolo
 
 echo.
@@ -17,10 +17,10 @@ echo ========================================
 echo   Auto Maple Navigation AI Trainer
 echo ========================================
 echo.
-echo This trains a separate navigation_scene.pt model.
-echo Classes: player / ladder / platform
-echo Monster-only legacy labels are automatically excluded.
-echo Existing assets\models\classic_scene.pt will NOT be modified.
+echo Classes: ladder / platform
+echo Player is intentionally excluded for now.
+echo Monster model classic_scene.pt will NOT be modified.
+echo Minimum first pass: 30 navigation-labeled images.
 echo.
 
 "%PY%" "tools\train_navigation.py"
@@ -30,7 +30,7 @@ if not "%RC%"=="0" goto :failed
 echo.
 echo [OK] Navigation training completed.
 echo [OK] Model: assets\models\navigation_scene.pt
-echo [OK] Monster model remains: assets\models\classic_scene.pt
+echo [OK] Next: run auto_label_navigation.bat
 goto :done
 
 :nopython
@@ -51,7 +51,7 @@ set "RC=1"
 goto :done
 
 :noyolo
-echo [ERROR] YOLO training packages are not installed.
+echo [ERROR] YOLO/PyTorch packages are not installed correctly.
 echo Run setup_ai.bat first.
 set "RC=1"
 goto :done
