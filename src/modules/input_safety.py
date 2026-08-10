@@ -1,12 +1,4 @@
-"""Robust hotkey polling and game-focus checks for patrol input.
-
-The classic client can consume keyboard events in ways that make the third-party
-``keyboard`` package miss Insert while MapleStory is focused.  Windows'
-GetAsyncKeyState is used for the core control hotkeys instead.  Patrol focus is
-validated by process identity rather than requiring the foreground HWND to be
-exactly the same HWND selected by WGC; some game/window configurations expose a
-child/owned foreground window belonging to the same MapleStory process.
-"""
+"""Robust hotkey polling and safe MapleStory focus checks for patrol input."""
 
 from __future__ import annotations
 
@@ -14,7 +6,6 @@ import ctypes
 
 
 user32 = ctypes.windll.user32
-kernel32 = ctypes.windll.kernel32
 
 VK_MAP = {
     "insert": 0x2D,
@@ -27,6 +18,8 @@ VK_MAP = {
     "f12": 0x7B,
 }
 
+GAME_TITLE_KEYWORDS = ("maplestory", "楓之谷")
+
 
 def _window_process_id(hwnd: int) -> int:
     if not hwnd or not user32.IsWindow(hwnd):
@@ -34,6 +27,22 @@ def _window_process_id(hwnd: int) -> int:
     pid = ctypes.c_ulong(0)
     user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
     return int(pid.value)
+
+
+def _window_title(hwnd: int) -> str:
+    if not hwnd or not user32.IsWindow(hwnd):
+        return ""
+    length = int(user32.GetWindowTextLengthW(hwnd) or 0)
+    if length <= 0:
+        return ""
+    buffer = ctypes.create_unicode_buffer(length + 1)
+    user32.GetWindowTextW(hwnd, buffer, len(buffer))
+    return buffer.value.strip()
+
+
+def _title_is_maple(title: str) -> bool:
+    normalized = (title or "").casefold()
+    return bool(normalized and any(keyword.casefold() in normalized for keyword in GAME_TITLE_KEYWORDS))
 
 
 def install_listener_hotkey_patch(listener_class) -> None:
@@ -64,32 +73,41 @@ def install_listener_hotkey_patch(listener_class) -> None:
 
 
 def install_patrol_focus_patch(patrol_class) -> None:
-    """Allow input only when foreground belongs to the captured game process."""
+    """Allow patrol input only while the foreground window is MapleStory.
+
+    The classic client may recreate its HWND or expose a foreground top-level
+    window whose PID differs from the stale handle WGC originally selected. We
+    therefore accept, in order: exact HWND, same process, or an explicit
+    MapleStory window title. CMD/browser/Desktop remain rejected.
+    """
     if getattr(patrol_class, "_process_focus_patch_installed", False):
         return
 
-    @staticmethod
     def foreground_is_game() -> bool:
         from src.common import config
 
         capture = getattr(config, "capture", None)
         if capture is None:
             return False
+
         game_hwnd = int(getattr(capture, "_handle", 0) or 0)
         foreground = int(user32.GetForegroundWindow() or 0)
-        if not game_hwnd or not foreground:
+        if not foreground or not user32.IsWindow(foreground):
             return False
 
-        # Exact match remains the fastest/safest case.
-        if foreground == game_hwnd and bool(user32.IsWindow(game_hwnd)):
-            return True
+        if game_hwnd and user32.IsWindow(game_hwnd):
+            if foreground == game_hwnd:
+                return True
 
-        # Owned/child foreground windows can have a different HWND while still
-        # belonging to the same MapleStory process.  Process equality keeps the
-        # safety boundary at the game process and will still reject CMD/browser.
-        game_pid = _window_process_id(game_hwnd)
-        foreground_pid = _window_process_id(foreground)
-        return bool(game_pid and foreground_pid and game_pid == foreground_pid)
+            game_pid = _window_process_id(game_hwnd)
+            foreground_pid = _window_process_id(foreground)
+            if game_pid and foreground_pid and game_pid == foreground_pid:
+                return True
 
-    patrol_class._foreground_is_game = foreground_is_game
+        # Conservative fallback for the classic client. The actual foreground
+        # window itself must identify as MapleStory; unrelated applications are
+        # never accepted merely because the stored capture handle became stale.
+        return _title_is_maple(_window_title(foreground))
+
+    patrol_class._foreground_is_game = staticmethod(foreground_is_game)
     patrol_class._process_focus_patch_installed = True
