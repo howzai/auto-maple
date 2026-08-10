@@ -26,15 +26,14 @@ if not exist "main.py" (
     exit /b 1
 )
 
-if not exist "capture_host\bin\Release\net8.0-windows10.0.19041.0\win-x64\MapleCaptureHost.exe" (
-    echo [~] MapleCaptureHost is not built. Building now...
-    dotnet build capture_host\MapleCaptureHost.csproj -c Release
-    if errorlevel 1 (
-        echo.
-        echo [ERROR] MapleCaptureHost build failed.
-        pause
-        exit /b 1
-    )
+echo [~] Refreshing MapleCaptureHost...
+dotnet build capture_host\MapleCaptureHost.csproj -c Release --nologo
+if errorlevel 1 (
+    echo.
+    echo [ERROR] MapleCaptureHost build failed.
+    echo Make sure the .NET 8 SDK is installed.
+    pause
+    exit /b 1
 )
 
 echo [~] Python executable:
