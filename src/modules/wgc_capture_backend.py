@@ -36,10 +36,7 @@ def _host_command() -> Optional[list[str]]:
     release_root = root / "capture_host" / "bin" / "Release"
 
     candidates = [
-        release_root
-        / "net8.0-windows10.0.19041.0"
-        / "win-x64"
-        / "MapleCaptureHost.exe",
+        release_root / "net8.0-windows10.0.19041.0" / "win-x64" / "MapleCaptureHost.exe",
         root / "capture_host" / "publish" / "MapleCaptureHost.exe",
         root / "MapleCaptureHost.exe",
     ]
@@ -48,10 +45,7 @@ def _host_command() -> Optional[list[str]]:
             return [str(candidate)]
 
     dll_candidates = [
-        release_root
-        / "net8.0-windows10.0.19041.0"
-        / "win-x64"
-        / "MapleCaptureHost.dll",
+        release_root / "net8.0-windows10.0.19041.0" / "win-x64" / "MapleCaptureHost.dll",
         root / "capture_host" / "publish" / "MapleCaptureHost.dll",
     ]
     for candidate in dll_candidates:
@@ -141,6 +135,8 @@ def install_wgc_capture(capture_class) -> None:
         self._wgc_host = CaptureHostController()
         self._wgc_frame_times = deque(maxlen=180)
         self._wgc_wait_started = 0.0
+        self._capture_target_pid = 0
+        self._capture_target_hwnd = 0
 
     def patched_stop(self):
         try:
@@ -168,6 +164,12 @@ def install_wgc_capture(capture_class) -> None:
         frame = None
         while frame is None and time.monotonic() < deadline:
             frame = reader.read_latest()
+            info = reader.last_info
+            if info is not None:
+                self._capture_target_pid = int(info.game_pid)
+                self._capture_target_hwnd = int(info.game_hwnd)
+                # Keep the legacy field synchronized for older code paths.
+                self._handle = int(info.game_hwnd)
             if frame is None:
                 time.sleep(FRAME_POLL_SECONDS)
 
