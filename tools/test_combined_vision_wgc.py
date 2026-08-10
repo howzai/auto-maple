@@ -1,32 +1,26 @@
 """Low-latency read-only combined vision test using Windows Graphics Capture.
 
-This tester reads MapleStory frames directly from MapleCaptureHost shared memory,
-so its own preview window is never captured recursively. Monster inference runs
-more often than navigation inference because ladders/platforms are effectively
-static scene geometry.
+Production-like scheduler:
+  * monster model:     20 Hz
+  * navigation model:  4 Hz
+  * debug preview:    10 Hz
 
-Models:
-    assets/models/classic_scene.pt      -> monster
-    assets/models/navigation_scene.pt   -> ladder / platform
-
-No game keys are ever sent. Press F10 or Escape to close.
+The latest detections are cached between inference passes. The preview uses OpenCV
+rather than Tk/PIL conversion, so debug rendering cannot dominate the test loop.
+No game input is sent.
 """
 
 from __future__ import annotations
 
 import argparse
+import ctypes
 import sys
 import time
 from pathlib import Path
-import tkinter as tk
-from tkinter import messagebox
 
 import cv2
 import numpy as np
-from PIL import Image, ImageTk
 
-# When this script is launched directly from tools/, Python only adds the tools
-# directory to sys.path. Add the project root before importing src.* modules.
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -36,24 +30,21 @@ from src.modules.wgc_capture_backend import CaptureHostController
 
 MONSTER_MODEL = ROOT / "assets" / "models" / "classic_scene.pt"
 NAV_MODEL = ROOT / "assets" / "models" / "navigation_scene.pt"
+WINDOW = "Auto Maple AI - Combined WGC Vision Test"
+VK_F10 = 0x79
 
 
 def _draw_box(frame: np.ndarray, xyxy, text: str, color) -> None:
     x1, y1, x2, y2 = [int(round(v)) for v in xyxy]
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-    scale = 0.55
-    thickness = 1
-    (tw, th), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)
-    ty = max(th + 4, y1)
-    cv2.rectangle(frame, (x1, ty - th - 4), (x1 + tw + 4, ty + baseline), (0, 0, 0), -1)
     cv2.putText(
         frame,
         text,
-        (x1 + 2, ty - 2),
+        (x1, max(18, y1 - 5)),
         cv2.FONT_HERSHEY_SIMPLEX,
-        scale,
+        0.50,
         color,
-        thickness,
+        1,
         cv2.LINE_AA,
     )
 
@@ -93,223 +84,173 @@ def _extract_navigation(results):
     return ladders, platforms
 
 
-class CombinedWgcVisionApp:
-    def __init__(
-        self,
-        monster_conf: float,
-        nav_conf: float,
-        imgsz: int,
-        monster_every: int,
-        nav_every: int,
-    ):
-        try:
-            import torch
-            from ultralytics import YOLO
-        except Exception as exc:
-            raise RuntimeError(f"YOLO/PyTorch unavailable: {exc}") from exc
-
-        if not MONSTER_MODEL.is_file():
-            raise RuntimeError(f"Monster model not found: {MONSTER_MODEL}")
-        if not NAV_MODEL.is_file():
-            raise RuntimeError(f"Navigation model not found: {NAV_MODEL}")
-
-        self.device = "0" if torch.cuda.is_available() else "cpu"
-        self.gpu_name = (
-            torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
-        )
-        self.monster = YOLO(str(MONSTER_MODEL))
-        self.navigation = YOLO(str(NAV_MODEL))
-        self.monster_conf = monster_conf
-        self.nav_conf = nav_conf
-        self.imgsz = imgsz
-        self.monster_every = max(1, monster_every)
-        self.nav_every = max(1, nav_every)
-
-        self.host = CaptureHostController()
-        self.reader = WindowsGraphicsCaptureReader()
-
-        self.monsters = []
-        self.ladders = []
-        self.platforms = []
-        self.monster_ms = 0.0
-        self.nav_ms = 0.0
-        self.frame_index = 0
-        self.last_frame_time = 0.0
-        self.display_fps = 0.0
-        self.closed = False
-        self.photo = None
-        self.last_error = ""
-
-        self.root = tk.Tk()
-        self.root.title("Auto Maple AI - Combined WGC Vision Test (F10 / Esc to close)")
-        self.root.configure(bg="black")
-        self.root.bind("<F10>", lambda _e: self.close())
-        self.root.bind("<Escape>", lambda _e: self.close())
-        self.root.protocol("WM_DELETE_WINDOW", self.close)
-
-        self.status = tk.StringVar(value="Starting Windows Graphics Capture...")
-        tk.Label(
-            self.root,
-            textvariable=self.status,
-            bg="black",
-            fg="white",
-            anchor="w",
-            font=("Segoe UI", 11, "bold"),
-        ).pack(fill=tk.X, padx=6, pady=4)
-        self.image_label = tk.Label(self.root, bg="black")
-        self.image_label.pack(fill=tk.BOTH, expand=True)
-
-        self.root.after(10, self.tick)
-
-    def close(self):
-        self.closed = True
-        try:
-            self.reader.close()
-        except Exception:
-            pass
-        try:
-            self.host.stop()
-        except Exception:
-            pass
-        try:
-            self.root.destroy()
-        except Exception:
-            pass
-
-    def _next_frame(self):
-        if not self.host.ensure_running():
-            return None
-        return self.reader.read_latest()
-
-    def tick(self):
-        if self.closed:
-            return
-
-        frame_started = time.perf_counter()
-        frame = self._next_frame()
-        if frame is None:
-            detail = self.reader.last_error or self.host.last_error or "Waiting for WGC frame"
-            self.status.set(f"WGC waiting: {detail}")
-            self.root.after(2, self.tick)
-            return
-
-        try:
-            # WGC publishes BGRA. Ultralytics/OpenCV numpy inputs use BGR.
-            bgr = frame[:, :, :3].copy()
-
-            if self.frame_index % self.monster_every == 0:
-                started = time.perf_counter()
-                results = self.monster.predict(
-                    bgr,
-                    imgsz=self.imgsz,
-                    conf=self.monster_conf,
-                    device=self.device,
-                    verbose=False,
-                )
-                self.monster_ms = (time.perf_counter() - started) * 1000.0
-                self.monsters = _extract_monsters(results)
-
-            if self.frame_index % self.nav_every == 0:
-                started = time.perf_counter()
-                results = self.navigation.predict(
-                    bgr,
-                    imgsz=self.imgsz,
-                    conf=self.nav_conf,
-                    device=self.device,
-                    verbose=False,
-                )
-                self.nav_ms = (time.perf_counter() - started) * 1000.0
-                self.ladders, self.platforms = _extract_navigation(results)
-
-            preview = bgr.copy()
-            for xyxy, conf in self.monsters:
-                _draw_box(preview, xyxy, f"monster {conf:.0%}", (20, 255, 57))
-            for xyxy, conf in self.ladders:
-                _draw_box(preview, xyxy, f"ladder {conf:.0%}", (0, 215, 255))
-            for xyxy, conf in self.platforms:
-                _draw_box(preview, xyxy, f"platform {conf:.0%}", (80, 127, 255))
-
-            now = time.perf_counter()
-            if self.last_frame_time:
-                instant = 1.0 / max(now - self.last_frame_time, 1e-6)
-                self.display_fps = instant if self.display_fps <= 0 else self.display_fps * 0.85 + instant * 0.15
-            self.last_frame_time = now
-
-            total_ms = (now - frame_started) * 1000.0
-            self.status.set(
-                f"GPU: {self.gpu_name} | FPS: {self.display_fps:.1f} | "
-                f"Monsters: {len(self.monsters)} | Ladders: {len(self.ladders)} | "
-                f"Platforms: {len(self.platforms)} | Monster: {self.monster_ms:.1f} ms/{self.monster_every}f | "
-                f"Nav: {self.nav_ms:.1f} ms/{self.nav_every}f | Frame: {total_ms:.1f} ms"
-            )
-
-            # Fast debug preview. Inference always uses the original full-size frame.
-            max_w, max_h = 1280, 720
-            h, w = preview.shape[:2]
-            scale = min(max_w / w, max_h / h, 1.0)
-            if scale < 1.0:
-                preview = cv2.resize(
-                    preview,
-                    (max(1, int(w * scale)), max(1, int(h * scale))),
-                    interpolation=cv2.INTER_AREA,
-                )
-            rgb = cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)
-            self.photo = ImageTk.PhotoImage(Image.fromarray(rgb))
-            self.image_label.configure(image=self.photo)
-            self.last_error = ""
-        except Exception as exc:
-            text = f"Combined WGC vision error: {exc}"
-            if text != self.last_error:
-                print(f"[ERROR] {text}")
-                self.last_error = text
-            self.status.set(text)
-
-        self.frame_index += 1
-        self.root.after(1, self.tick)
-
-    def run(self):
-        print("\n========================================")
-        print("  Auto Maple Combined WGC Vision Test")
-        print("========================================")
-        print(f"Monster model: {MONSTER_MODEL}")
-        print(f"Navigation model: {NAV_MODEL}")
-        print(f"GPU: {self.gpu_name} (device {self.device})")
-        print(f"Monster inference cadence: every {self.monster_every} frame(s)")
-        print(f"Navigation inference cadence: every {self.nav_every} frame(s)")
-        print("Capture: Windows Graphics Capture shared memory (no desktop/MSS recursion)")
-        print("READ ONLY: no game keys are sent.")
-        print("Press F10 or Escape in the preview window to close.\n")
-        self.root.mainloop()
+def _f10_pressed() -> bool:
+    try:
+        return bool(ctypes.windll.user32.GetAsyncKeyState(VK_F10) & 0x8000)
+    except Exception:
+        return False
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Low-latency combined Auto Maple WGC test")
+    parser = argparse.ArgumentParser(description="Production-like combined WGC vision test")
     parser.add_argument("--monster-conf", type=float, default=0.45)
     parser.add_argument("--nav-conf", type=float, default=0.40)
     parser.add_argument("--imgsz", type=int, default=640)
-    parser.add_argument("--monster-every", type=int, default=2)
-    parser.add_argument("--nav-every", type=int, default=5)
+    parser.add_argument("--monster-hz", type=float, default=20.0)
+    parser.add_argument("--nav-hz", type=float, default=4.0)
+    parser.add_argument("--preview-hz", type=float, default=10.0)
     args = parser.parse_args()
 
     try:
-        app = CombinedWgcVisionApp(
-            monster_conf=min(max(args.monster_conf, 0.05), 0.99),
-            nav_conf=min(max(args.nav_conf, 0.05), 0.99),
-            imgsz=max(320, args.imgsz),
-            monster_every=max(1, args.monster_every),
-            nav_every=max(1, args.nav_every),
-        )
-        app.run()
+        import torch
+        from ultralytics import YOLO
     except Exception as exc:
-        print(f"[ERROR] {exc}")
-        try:
-            root = tk.Tk()
-            root.withdraw()
-            messagebox.showerror("Auto Maple Combined WGC Vision", str(exc))
-            root.destroy()
-        except Exception:
-            pass
+        print(f"[ERROR] YOLO/PyTorch unavailable: {exc}")
         return 1
+
+    if not MONSTER_MODEL.is_file():
+        print(f"[ERROR] Monster model not found: {MONSTER_MODEL}")
+        return 1
+    if not NAV_MODEL.is_file():
+        print(f"[ERROR] Navigation model not found: {NAV_MODEL}")
+        return 1
+
+    device = "0" if torch.cuda.is_available() else "cpu"
+    gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
+    monster = YOLO(str(MONSTER_MODEL))
+    navigation = YOLO(str(NAV_MODEL))
+
+    monster_interval = 1.0 / max(1.0, args.monster_hz)
+    nav_interval = 1.0 / max(0.5, args.nav_hz)
+    preview_interval = 1.0 / max(1.0, args.preview_hz)
+    monster_conf = min(max(args.monster_conf, 0.05), 0.99)
+    nav_conf = min(max(args.nav_conf, 0.05), 0.99)
+    imgsz = max(320, args.imgsz)
+
+    host = CaptureHostController()
+    reader = WindowsGraphicsCaptureReader()
+
+    monsters = []
+    ladders = []
+    platforms = []
+    monster_ms = 0.0
+    nav_ms = 0.0
+    last_monster = 0.0
+    last_nav = 0.0
+    last_preview = 0.0
+    preview_fps = 0.0
+    last_preview_stamp = 0.0
+    latest_bgr = None
+
+    print("\n========================================")
+    print("  Auto Maple Combined WGC Vision Test")
+    print("========================================")
+    print(f"GPU: {gpu_name} (device {device})")
+    print(f"Monster: {args.monster_hz:.1f} Hz | Navigation: {args.nav_hz:.1f} Hz | Preview: {args.preview_hz:.1f} Hz")
+    print("Capture: Windows Graphics Capture shared memory")
+    print("READ ONLY: no game keys are sent.")
+    print("Press F10, Esc, or Q to close.\n")
+
+    cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
+
+    try:
+        while True:
+            if _f10_pressed():
+                break
+
+            if not host.ensure_running():
+                time.sleep(0.05)
+                continue
+
+            frame = reader.read_latest()
+            if frame is not None:
+                latest_bgr = frame[:, :, :3].copy()
+
+            if latest_bgr is None:
+                key = cv2.waitKey(1) & 0xFF
+                if key in (27, ord("q"), ord("Q")):
+                    break
+                time.sleep(0.002)
+                continue
+
+            now = time.perf_counter()
+
+            if now - last_monster >= monster_interval:
+                started = time.perf_counter()
+                results = monster.predict(
+                    latest_bgr,
+                    imgsz=imgsz,
+                    conf=monster_conf,
+                    device=device,
+                    verbose=False,
+                )
+                monster_ms = (time.perf_counter() - started) * 1000.0
+                monsters = _extract_monsters(results)
+                last_monster = now
+
+            if now - last_nav >= nav_interval:
+                started = time.perf_counter()
+                results = navigation.predict(
+                    latest_bgr,
+                    imgsz=imgsz,
+                    conf=nav_conf,
+                    device=device,
+                    verbose=False,
+                )
+                nav_ms = (time.perf_counter() - started) * 1000.0
+                ladders, platforms = _extract_navigation(results)
+                last_nav = now
+
+            if now - last_preview >= preview_interval:
+                preview = latest_bgr.copy()
+                for xyxy, conf in monsters:
+                    _draw_box(preview, xyxy, f"monster {conf:.0%}", (20, 255, 57))
+                for xyxy, conf in ladders:
+                    _draw_box(preview, xyxy, f"ladder {conf:.0%}", (0, 215, 255))
+                for xyxy, conf in platforms:
+                    _draw_box(preview, xyxy, f"platform {conf:.0%}", (80, 127, 255))
+
+                h, w = preview.shape[:2]
+                cv2.drawMarker(preview, (w // 2, h // 2), (255, 255, 255), cv2.MARKER_CROSS, 20, 2)
+
+                if last_preview_stamp:
+                    instant = 1.0 / max(now - last_preview_stamp, 1e-6)
+                    preview_fps = instant if preview_fps <= 0 else preview_fps * 0.8 + instant * 0.2
+                last_preview_stamp = now
+
+                hud1 = (
+                    f"GPU: {gpu_name} | Preview: {preview_fps:.1f} FPS | "
+                    f"Monsters: {len(monsters)} | Ladders: {len(ladders)} | Platforms: {len(platforms)}"
+                )
+                hud2 = (
+                    f"Monster: {monster_ms:.1f} ms @ {args.monster_hz:.0f}Hz | "
+                    f"Nav: {nav_ms:.1f} ms @ {args.nav_hz:.0f}Hz"
+                )
+                cv2.rectangle(preview, (8, 8), (min(w - 8, 1040), 66), (0, 0, 0), -1)
+                cv2.putText(preview, hud1, (18, 31), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+                cv2.putText(preview, hud2, (18, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 1, cv2.LINE_AA)
+
+                target_w = min(1280, w)
+                target_h = max(360, int(h * target_w / max(1, w)))
+                cv2.resizeWindow(WINDOW, target_w, target_h)
+                cv2.imshow(WINDOW, preview)
+                last_preview = now
+
+            key = cv2.waitKey(1) & 0xFF
+            if key in (27, ord("q"), ord("Q")):
+                break
+            time.sleep(0.001)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        reader.close()
+        host.stop()
+        try:
+            cv2.destroyWindow(WINDOW)
+            cv2.waitKey(1)
+        except cv2.error:
+            pass
+
     return 0
 
 
