@@ -1,8 +1,16 @@
-"""Non-blocking main-scene observation for the classic client.
+"""Low-latency combined main-scene observation for the classic client.
 
-This phase is observation-only: it never presses game keys. It reads the latest WGC
-frame, runs the trained classic_scene.pt detector, publishes diagnostics for the GUI,
-and can show a live F10 debug preview with YOLO boxes.
+The production observer consumes frames already published by Windows Graphics
+Capture.  It keeps the proven monster detector and navigation detector separate,
+but schedules them at different rates:
+
+* classic_scene.pt:      high-frequency monster detection
+* navigation_scene.pt:  low-frequency ladder/platform detection
+
+Ladders and platforms are effectively static scene geometry, so their most recent
+results are cached between navigation passes.  F10 only visualizes the cached
+production results; enabling the preview does not create another inference path.
+This module never sends game input.
 """
 
 from __future__ import annotations
@@ -11,7 +19,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -33,6 +41,11 @@ class SceneDetection:
         x1, y1, x2, y2 = self.box
         return ((x1 + x2) // 2, (y1 + y2) // 2)
 
+    @property
+    def foot(self) -> Point:
+        x1, _y1, x2, y2 = self.box
+        return ((x1 + x2) // 2, y2)
+
 
 @dataclass(frozen=True)
 class SceneSnapshot:
@@ -41,9 +54,12 @@ class SceneSnapshot:
     mode: str = "observe"
     model_status: str = "not-loaded"
     inference_ms: float = 0.0
+    monster_inference_ms: float = 0.0
+    navigation_inference_ms: float = 0.0
     player: Optional[SceneDetection] = None
     monsters: Tuple[SceneDetection, ...] = field(default_factory=tuple)
     ladders: Tuple[SceneDetection, ...] = field(default_factory=tuple)
+    platforms: Tuple[SceneDetection, ...] = field(default_factory=tuple)
     obstacles: Tuple[SceneDetection, ...] = field(default_factory=tuple)
     nearest_monster_direction: str = "none"
     nearest_monster_distance: Optional[float] = None
@@ -52,21 +68,24 @@ class SceneSnapshot:
 
 
 class SceneObserver:
-    """Observe the gameplay scene without delaying capture or controlling input."""
+    """Observe the gameplay scene without delaying WGC or controlling input."""
 
-    TARGET_FPS = 10
-    FRAME_INTERVAL = 1.0 / TARGET_FPS
-    MODEL_FILENAME = "classic_scene.pt"
-    DEBUG_WINDOW = "Auto Maple AI - Monster Vision (F10 to close)"
-    CLASS_ALIASES: Dict[str, str] = {
-        "character": "player",
-        "hero": "player",
-        "mob": "monster",
-        "enemy": "monster",
-        "rope": "ladder",
-        "wall": "obstacle",
-        "block": "obstacle",
-    }
+    # Scheduler. Capture itself runs independently at ~30 FPS.
+    LOOP_HZ = 30
+    LOOP_INTERVAL = 1.0 / LOOP_HZ
+    MONSTER_HZ = 20
+    MONSTER_INTERVAL = 1.0 / MONSTER_HZ
+    NAVIGATION_HZ = 4
+    NAVIGATION_INTERVAL = 1.0 / NAVIGATION_HZ
+    DEBUG_HZ = 10
+    DEBUG_INTERVAL = 1.0 / DEBUG_HZ
+
+    MONSTER_MODEL_FILENAME = "classic_scene.pt"
+    NAVIGATION_MODEL_FILENAME = "navigation_scene.pt"
+    MONSTER_CONFIDENCE = 0.45
+    NAVIGATION_CONFIDENCE = 0.40
+    IMAGE_SIZE = 640
+    DEBUG_WINDOW = "Auto Maple AI - Combined Vision (F10 to close)"
 
     def __init__(self):
         config.scene_observer = self
@@ -74,10 +93,25 @@ class SceneObserver:
         self.enabled = True
         self.debug_enabled = False
         self.last_error: Optional[str] = None
-        self._model = None
-        self._model_attempted = False
-        self._model_status = "not-loaded"
+
+        self._monster_model = None
+        self._navigation_model = None
+        self._models_attempted = False
+        self._monster_status = "not-loaded"
+        self._navigation_status = "not-loaded"
+        self._device = None
+        self._gpu_name = "unknown"
+
         self._last_source_frame_id = -1
+        self._last_monster_run = 0.0
+        self._last_navigation_run = 0.0
+        self._last_debug_draw = 0.0
+        self._monster_ms = 0.0
+        self._navigation_ms = 0.0
+        self._monsters: List[SceneDetection] = []
+        self._ladders: List[SceneDetection] = []
+        self._platforms: List[SceneDetection] = []
+
         self._snapshot = SceneSnapshot()
         self._debug_frame: Optional[np.ndarray] = None
         self._debug_window_open = False
@@ -90,7 +124,9 @@ class SceneObserver:
         )
 
     def start(self):
-        print("\n[~] Started main-scene observer (observation only)")
+        print("\n[~] Started combined main-scene observer (observation only)")
+        print(f"[~] Monster vision target: {self.MONSTER_HZ} Hz")
+        print(f"[~] Navigation vision target: {self.NAVIGATION_HZ} Hz")
         self.thread.start()
 
     def stop(self):
@@ -111,91 +147,138 @@ class SceneObserver:
             with self._lock:
                 self._debug_frame = None
             self._close_debug_window()
-        print(f"\n[~] Vision debug {'enabled' if self.debug_enabled else 'disabled'}")
+        print(f"\n[~] Combined vision debug {'enabled' if self.debug_enabled else 'disabled'}")
         if self.debug_enabled:
-            print("[~] Live monster preview will open when the next WGC frame is processed")
+            print("[~] F10 preview uses the production Monster + Ladder + Platform cache")
         return self.debug_enabled
 
     @staticmethod
     def _project_root() -> Path:
         return Path(__file__).resolve().parents[2]
 
-    def _load_model(self):
-        if self._model_attempted:
-            return self._model
-        self._model_attempted = True
-        weights = self._project_root() / "assets" / "models" / self.MODEL_FILENAME
-        if not weights.is_file():
-            self._model_status = "model-not-trained"
-            return None
-        try:
-            from ultralytics import YOLO
+    def _load_models(self) -> None:
+        if self._models_attempted:
+            return
+        self._models_attempted = True
 
-            print(f"\n[~] Loading scene model: {weights}")
-            self._model = YOLO(str(weights))
-            self._model_status = "ready"
-            print("[~] Scene model ready: classic_scene.pt")
+        root = self._project_root()
+        monster_weights = root / "assets" / "models" / self.MONSTER_MODEL_FILENAME
+        nav_weights = root / "assets" / "models" / self.NAVIGATION_MODEL_FILENAME
+
+        try:
+            import torch
+            from ultralytics import YOLO
         except Exception as exc:
-            self._model_status = "load-error"
-            self.last_error = f"Scene model load failed: {exc}"
-            self._model = None
-        return self._model
+            self.last_error = f"YOLO/PyTorch unavailable: {exc}"
+            self._monster_status = "load-error"
+            self._navigation_status = "load-error"
+            return
+
+        if torch.cuda.is_available():
+            self._device = "0"
+            self._gpu_name = torch.cuda.get_device_name(0)
+        else:
+            self._device = "cpu"
+            self._gpu_name = "CPU"
+
+        if monster_weights.is_file():
+            try:
+                print(f"\n[~] Loading monster model: {monster_weights}")
+                self._monster_model = YOLO(str(monster_weights))
+                self._monster_status = "ready"
+                print("[~] Monster model ready: classic_scene.pt")
+            except Exception as exc:
+                self._monster_status = "load-error"
+                self.last_error = f"Monster model load failed: {exc}"
+        else:
+            self._monster_status = "model-not-trained"
+
+        if nav_weights.is_file():
+            try:
+                print(f"\n[~] Loading navigation model: {nav_weights}")
+                self._navigation_model = YOLO(str(nav_weights))
+                self._navigation_status = "ready"
+                print("[~] Navigation model ready: navigation_scene.pt")
+            except Exception as exc:
+                self._navigation_status = "load-error"
+                self.last_error = f"Navigation model load failed: {exc}"
+        else:
+            self._navigation_status = "model-not-trained"
+
+        print(f"[~] Vision device: {self._gpu_name} ({self._device})")
 
     @staticmethod
-    def _gameplay_bounds(frame: np.ndarray, capture) -> Box:
+    def _full_frame_bounds(frame: np.ndarray) -> Box:
+        # Combined test and training images use the full WGC frame. Keeping the
+        # production observer identical avoids crop-induced misses near map edges.
         height, width = frame.shape[:2]
-        snapshot = getattr(capture, "fixed_ui_snapshot", None)
-        if snapshot is not None:
-            region = getattr(snapshot, "gameplay_area", None)
-            if region is not None:
-                (x1, y1), (x2, y2) = region.bounds
-                return max(0, x1), max(0, y1), min(width, x2), min(height, y2)
-        return 0, int(height * 0.08), width, int(height * 0.855)
+        return 0, 0, width, height
 
-    @classmethod
-    def _canonical_label(cls, label: str) -> str:
-        normalized = label.casefold().strip()
-        return cls.CLASS_ALIASES.get(normalized, normalized)
-
-    def _predict(self, frame: np.ndarray, bounds: Box) -> Tuple[List[SceneDetection], float]:
-        model = self._load_model()
-        if model is None:
-            return [], 0.0
-        x1, y1, x2, y2 = bounds
-        crop = frame[y1:y2, x1:x2, :3]
-        if crop.size == 0:
-            return [], 0.0
-
+    @staticmethod
+    def _predict_model(model, frame: np.ndarray, confidence: float, device) -> Tuple[object, float]:
+        # WGC publishes BGRA. Ultralytics/OpenCV numpy input is BGR.
+        bgr = frame[:, :, :3]
         started = time.perf_counter()
-        results = model.predict(crop, imgsz=640, conf=0.45, verbose=False)
-        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        results = model.predict(
+            bgr,
+            imgsz=SceneObserver.IMAGE_SIZE,
+            conf=confidence,
+            device=device,
+            verbose=False,
+        )
+        return results, (time.perf_counter() - started) * 1000.0
+
+    @staticmethod
+    def _monster_detections(results) -> List[SceneDetection]:
         detections: List[SceneDetection] = []
         for result in results:
-            names = result.names
+            names = getattr(result, "names", {})
             boxes = getattr(result, "boxes", None)
             if boxes is None:
                 continue
             for box in boxes:
                 class_id = int(box.cls[0])
-                label = self._canonical_label(str(names.get(class_id, class_id)))
-                confidence = float(box.conf[0])
-                bx1, by1, bx2, by2 = (
-                    int(round(value)) for value in box.xyxy[0].tolist()
-                )
+                label = str(names.get(class_id, class_id)).casefold().strip()
+                if label not in {"monster", "mob", "enemy", "0"} and len(names) > 1:
+                    continue
+                x1, y1, x2, y2 = [int(round(v)) for v in box.xyxy[0].tolist()]
                 detections.append(
-                    SceneDetection(
-                        label=label,
-                        confidence=confidence,
-                        box=(bx1 + x1, by1 + y1, bx2 + x1, by2 + y1),
-                    )
+                    SceneDetection("monster", float(box.conf[0]), (x1, y1, x2, y2))
                 )
-        return detections, elapsed_ms
+        return detections
 
     @staticmethod
-    def _nearest(player: Optional[SceneDetection], monsters: List[SceneDetection]):
-        if player is None or not monsters:
+    def _navigation_detections(results) -> Tuple[List[SceneDetection], List[SceneDetection]]:
+        ladders: List[SceneDetection] = []
+        platforms: List[SceneDetection] = []
+        for result in results:
+            names = getattr(result, "names", {})
+            boxes = getattr(result, "boxes", None)
+            if boxes is None:
+                continue
+            for box in boxes:
+                class_id = int(box.cls[0])
+                label = str(names.get(class_id, class_id)).casefold().strip()
+                x1, y1, x2, y2 = [int(round(v)) for v in box.xyxy[0].tolist()]
+                detection = SceneDetection(label, float(box.conf[0]), (x1, y1, x2, y2))
+                if label == "ladder" or (len(names) == 2 and class_id == 0):
+                    ladders.append(SceneDetection("ladder", detection.confidence, detection.box))
+                elif label == "platform" or (len(names) == 2 and class_id == 1):
+                    platforms.append(SceneDetection("platform", detection.confidence, detection.box))
+        return ladders, platforms
+
+    @staticmethod
+    def _center_anchor(frame: np.ndarray) -> Point:
+        # The scrolling camera normally keeps the local character near center.
+        # This is only a relative combat anchor; minimap remains the global locator.
+        height, width = frame.shape[:2]
+        return width // 2, height // 2
+
+    @classmethod
+    def _nearest_to_anchor(cls, frame: np.ndarray, monsters: List[SceneDetection]):
+        if not monsters:
             return "none", None
-        px, py = player.center
+        px, py = cls._center_anchor(frame)
         nearest = min(
             monsters,
             key=lambda item: (item.center[0] - px) ** 2 + (item.center[1] - py) ** 2,
@@ -209,47 +292,46 @@ class SceneObserver:
             direction = "below" if dy >= 0 else "above"
         return direction, distance
 
-    @staticmethod
-    def _draw_debug(
-        frame: np.ndarray,
-        detections: List[SceneDetection],
-        bounds: Box,
-        inference_ms: float,
-        model_status: str,
-    ) -> np.ndarray:
-        debug = frame[:, :, :3].copy()
-        x1, y1, x2, y2 = bounds
-        cv2.rectangle(debug, (x1, y1), (x2, y2), (255, 255, 255), 1)
+    def _model_status_text(self) -> str:
+        return f"monster={self._monster_status}, nav={self._navigation_status}"
 
-        monsters = 0
-        for item in detections:
-            bx1, by1, bx2, by2 = item.box
-            if item.label == "monster":
-                monsters += 1
-            cv2.rectangle(debug, (bx1, by1), (bx2, by2), (255, 255, 255), 2)
+    def _draw_debug(self, frame: np.ndarray) -> np.ndarray:
+        debug = frame[:, :, :3].copy()
+        colors = {
+            "monster": (20, 255, 57),
+            "ladder": (0, 215, 255),
+            "platform": (80, 127, 255),
+        }
+        for item in [*self._monsters, *self._ladders, *self._platforms]:
+            x1, y1, x2, y2 = item.box
+            color = colors.get(item.label, (255, 255, 255))
+            cv2.rectangle(debug, (x1, y1), (x2, y2), color, 2)
             cv2.putText(
                 debug,
                 f"{item.label} {item.confidence * 100:.0f}%",
-                (bx1, max(20, by1 - 6)),
+                (x1, max(20, y1 - 5)),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                (255, 255, 255),
-                2,
+                0.50,
+                color,
+                1,
                 cv2.LINE_AA,
             )
 
-        hud = f"AI: {model_status}   Monsters: {monsters}   Inference: {inference_ms:.1f} ms"
-        cv2.rectangle(debug, (8, 8), (min(debug.shape[1] - 8, 590), 42), (0, 0, 0), -1)
-        cv2.putText(
-            debug,
-            hud,
-            (18, 32),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.62,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA,
+        px, py = self._center_anchor(debug)
+        cv2.drawMarker(debug, (px, py), (255, 255, 255), cv2.MARKER_CROSS, 20, 2)
+
+        hud1 = (
+            f"GPU: {self._gpu_name} | Monsters: {len(self._monsters)} | "
+            f"Ladders: {len(self._ladders)} | Platforms: {len(self._platforms)}"
         )
+        hud2 = (
+            f"Monster: {self._monster_ms:.1f} ms @ {self.MONSTER_HZ}Hz | "
+            f"Nav: {self._navigation_ms:.1f} ms @ {self.NAVIGATION_HZ}Hz | "
+            f"Preview: {self.DEBUG_HZ}Hz"
+        )
+        cv2.rectangle(debug, (8, 8), (min(debug.shape[1] - 8, 980), 66), (0, 0, 0), -1)
+        cv2.putText(debug, hud1, (18, 31), cv2.FONT_HERSHEY_SIMPLEX, 0.56, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(debug, hud2, (18, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 1, cv2.LINE_AA)
         return debug
 
     def _show_debug_window(self, debug: np.ndarray) -> None:
@@ -282,6 +364,8 @@ class SceneObserver:
         if capture is None:
             raise RuntimeError("Capture service is unavailable")
 
+        self._load_models()
+
         with capture._state_lock:
             frame = None if capture.frame is None else capture.frame.copy()
             source_frame_id = int(getattr(capture, "frame_id", 0))
@@ -289,35 +373,52 @@ class SceneObserver:
         if frame is None or source_frame_id == self._last_source_frame_id:
             return
         self._last_source_frame_id = source_frame_id
-        bounds = self._gameplay_bounds(frame, capture)
-        detections, inference_ms = self._predict(frame, bounds)
+        now = time.monotonic()
 
-        players = [item for item in detections if item.label == "player"]
-        monsters = [item for item in detections if item.label == "monster"]
-        ladders = [item for item in detections if item.label == "ladder"]
-        obstacles = [item for item in detections if item.label == "obstacle"]
-        player = max(players, key=lambda item: item.confidence) if players else None
-        direction, distance = self._nearest(player, monsters)
+        if self._monster_model is not None and now - self._last_monster_run >= self.MONSTER_INTERVAL:
+            results, self._monster_ms = self._predict_model(
+                self._monster_model,
+                frame,
+                self.MONSTER_CONFIDENCE,
+                self._device,
+            )
+            self._monsters = self._monster_detections(results)
+            self._last_monster_run = now
 
-        if self._model_status == "model-not-trained":
-            event = "Scene model not trained; capture pipeline is ready"
-        elif self._model_status != "ready":
-            event = f"Scene model status: {self._model_status}"
-        elif monsters:
-            event = f"Tracking {len(monsters)} monster(s)"
+        if self._navigation_model is not None and now - self._last_navigation_run >= self.NAVIGATION_INTERVAL:
+            results, self._navigation_ms = self._predict_model(
+                self._navigation_model,
+                frame,
+                self.NAVIGATION_CONFIDENCE,
+                self._device,
+            )
+            self._ladders, self._platforms = self._navigation_detections(results)
+            self._last_navigation_run = now
+
+        direction, distance = self._nearest_to_anchor(frame, self._monsters)
+        total_ms = self._monster_ms + self._navigation_ms
+
+        if self._monster_status != "ready" and self._navigation_status != "ready":
+            event = "Scene models are not ready"
+        elif self._monsters:
+            event = (
+                f"Tracking {len(self._monsters)} monster(s), "
+                f"{len(self._ladders)} ladder(s), {len(self._platforms)} platform(s)"
+            )
         else:
-            event = "No monster detected"
+            event = f"No monster detected; navigation cache has {len(self._ladders)} ladder(s)"
 
         snapshot = SceneSnapshot(
-            timestamp=time.monotonic(),
+            timestamp=now,
             frame_id=source_frame_id,
-            mode="observe",
-            model_status=self._model_status,
-            inference_ms=inference_ms,
-            player=player,
-            monsters=tuple(monsters),
-            ladders=tuple(ladders),
-            obstacles=tuple(obstacles),
+            mode="observe-combined",
+            model_status=self._model_status_text(),
+            inference_ms=total_ms,
+            monster_inference_ms=self._monster_ms,
+            navigation_inference_ms=self._navigation_ms,
+            monsters=tuple(self._monsters),
+            ladders=tuple(self._ladders),
+            platforms=tuple(self._platforms),
             nearest_monster_direction=direction,
             nearest_monster_distance=distance,
             last_event=event,
@@ -325,15 +426,17 @@ class SceneObserver:
         )
 
         debug = None
-        if self.debug_enabled:
-            debug = self._draw_debug(frame, detections, bounds, inference_ms, self._model_status)
+        if self.debug_enabled and now - self._last_debug_draw >= self.DEBUG_INTERVAL:
+            debug = self._draw_debug(frame)
             self._show_debug_window(debug)
-        elif self._debug_window_open:
+            self._last_debug_draw = now
+        elif not self.debug_enabled and self._debug_window_open:
             self._close_debug_window()
 
         with self._lock:
             self._snapshot = snapshot
-            self._debug_frame = debug
+            if debug is not None:
+                self._debug_frame = debug
 
     def _main(self):
         self.ready = True
@@ -348,14 +451,14 @@ class SceneObserver:
                     self._snapshot = SceneSnapshot(
                         timestamp=time.monotonic(),
                         frame_id=self._last_source_frame_id,
-                        mode="observe",
-                        model_status=self._model_status,
+                        mode="observe-combined",
+                        model_status=self._model_status_text(),
                         last_event="Observer error",
                         last_error=self.last_error,
                     )
-                time.sleep(0.5)
+                time.sleep(0.25)
 
-            remaining = self.FRAME_INTERVAL - (time.perf_counter() - started)
+            remaining = self.LOOP_INTERVAL - (time.perf_counter() - started)
             if remaining > 0:
                 time.sleep(remaining)
 
