@@ -8,10 +8,8 @@ from ctypes import wintypes
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 
-# IMPORTANT: on 64-bit Windows an HWND is pointer-sized.  ctypes defaults the
-# return type of an undeclared Win32 function to c_int, which truncates HWNDs and
-# makes IsWindow/GetWindowText/GetWindowThreadProcessId fail even though the game
-# is visibly in the foreground.  Declare every window API used here explicitly.
+# IMPORTANT: HWND is pointer-sized on 64-bit Windows. Declare every Win32 API
+# used here so ctypes never truncates a handle.
 user32.GetForegroundWindow.argtypes = ()
 user32.GetForegroundWindow.restype = wintypes.HWND
 user32.IsWindow.argtypes = (wintypes.HWND,)
@@ -30,6 +28,24 @@ user32.GetWindow.argtypes = (wintypes.HWND, wintypes.UINT)
 user32.GetWindow.restype = wintypes.HWND
 user32.GetAsyncKeyState.argtypes = (ctypes.c_int,)
 user32.GetAsyncKeyState.restype = ctypes.c_short
+
+
+class GUITHREADINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("flags", wintypes.DWORD),
+        ("hwndActive", wintypes.HWND),
+        ("hwndFocus", wintypes.HWND),
+        ("hwndCapture", wintypes.HWND),
+        ("hwndMenuOwner", wintypes.HWND),
+        ("hwndMoveSize", wintypes.HWND),
+        ("hwndCaret", wintypes.HWND),
+        ("rcCaret", wintypes.RECT),
+    ]
+
+
+user32.GetGUIThreadInfo.argtypes = (wintypes.DWORD, ctypes.POINTER(GUITHREADINFO))
+user32.GetGUIThreadInfo.restype = wintypes.BOOL
 
 VK_MAP = {
     "insert": 0x2D,
@@ -112,6 +128,38 @@ def _related_windows(hwnd: int):
     return tuple(result)
 
 
+def _focus_candidates():
+    """Return all Win32 handles that can represent the currently active UI.
+
+    GetForegroundWindow alone is unreliable for some older DirectX clients.
+    GetGUIThreadInfo(0) also exposes hwndActive/hwndFocus for the foreground input
+    queue, which is often the actual game child window.
+    """
+    result = []
+
+    def add(hwnd):
+        value = int(hwnd or 0)
+        if _valid_hwnd(value) and value not in result:
+            result.append(value)
+
+    add(user32.GetForegroundWindow())
+    info = GUITHREADINFO()
+    info.cbSize = ctypes.sizeof(GUITHREADINFO)
+    if user32.GetGUIThreadInfo(0, ctypes.byref(info)):
+        add(info.hwndActive)
+        add(info.hwndFocus)
+        add(info.hwndCapture)
+        add(info.hwndMenuOwner)
+        add(info.hwndMoveSize)
+
+    expanded = []
+    for hwnd in result:
+        for related in _related_windows(hwnd):
+            if related not in expanded:
+                expanded.append(related)
+    return tuple(expanded)
+
+
 def _describe(hwnd: int) -> str:
     return (
         f"hwnd=0x{int(hwnd or 0):X} pid={_window_process_id(hwnd)} "
@@ -146,7 +194,7 @@ def install_listener_hotkey_patch(listener_class) -> None:
 
 
 def install_patrol_focus_patch(patrol_class) -> None:
-    """Trust the exact HWND/PID selected by MapleCaptureHost."""
+    """Trust the exact WGC target and accept Win32 active/focus child windows."""
     if getattr(patrol_class, "_process_focus_patch_installed", False):
         return
 
@@ -159,26 +207,24 @@ def install_patrol_focus_patch(patrol_class) -> None:
 
         game_hwnd = int(getattr(capture, "_capture_target_hwnd", 0) or 0)
         game_pid = int(getattr(capture, "_capture_target_pid", 0) or 0)
-        foreground = int(user32.GetForegroundWindow() or 0)
-        if not _valid_hwnd(foreground):
+        active_family = _focus_candidates()
+        if not active_family:
             return False
-
-        foreground_family = _related_windows(foreground)
 
         if game_hwnd:
             game_family = _related_windows(game_hwnd)
-            if set(foreground_family).intersection(game_family):
+            if set(active_family).intersection(game_family):
                 return True
 
         if game_pid:
-            foreground_pids = {_window_process_id(hwnd) for hwnd in foreground_family}
-            foreground_pids.discard(0)
-            if game_pid in foreground_pids:
+            active_pids = {_window_process_id(hwnd) for hwnd in active_family}
+            active_pids.discard(0)
+            if game_pid in active_pids:
                 return True
 
-        # Safe fallback: the actual foreground/root-owner family itself must
-        # explicitly identify as MapleStory.  Browser/CMD/Desktop still fail.
-        return any(_title_is_maple(_window_title(hwnd)) for hwnd in foreground_family)
+        # Conservative fallback: one of the actual active/focus/root-owner HWNDs
+        # must explicitly identify as MapleStory. Browser/CMD/Desktop still fail.
+        return any(_title_is_maple(_window_title(hwnd)) for hwnd in active_family)
 
     def focus_debug_text() -> str:
         from src.common import config
@@ -186,12 +232,11 @@ def install_patrol_focus_patch(patrol_class) -> None:
         capture = getattr(config, "capture", None)
         game_hwnd = int(getattr(capture, "_capture_target_hwnd", 0) or 0) if capture is not None else 0
         game_pid = int(getattr(capture, "_capture_target_pid", 0) or 0) if capture is not None else 0
-        foreground = int(user32.GetForegroundWindow() or 0)
-        fg_family = _related_windows(foreground)
-        fg_text = "; ".join(_describe(hwnd) for hwnd in fg_family) or _describe(foreground)
+        active = _focus_candidates()
+        active_text = "; ".join(_describe(hwnd) for hwnd in active) or "none"
         game_text = _describe(game_hwnd) if game_hwnd else "none"
         return (
-            f"foreground=[{fg_text}] "
+            f"active=[{active_text}] "
             f"wgc_target=[{game_text}] shared_game_pid={game_pid}"
         )
 
