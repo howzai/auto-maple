@@ -9,7 +9,7 @@ internal sealed class SharedFrameBuffer : IDisposable
     public const string MappingName = "Local\\AutoMaple.GraphicsCapture.Frame";
     public const string ReadyEventName = "Local\\AutoMaple.GraphicsCapture.FrameReady";
     public const uint Magic = 0x50414D41; // AMAP
-    public const int Version = 1;
+    public const int Version = 2;
     public const int HeaderSize = 64;
     public const int BytesPerPixel = 4;
 
@@ -18,6 +18,8 @@ internal sealed class SharedFrameBuffer : IDisposable
     private readonly EventWaitHandle _frameReady;
     private readonly int _capacity;
     private long _frameId;
+    private int _gameProcessId;
+    private long _gameWindowHandle;
 
     public SharedFrameBuffer(int maxWidth = 2560, int maxHeight = 1440)
     {
@@ -31,6 +33,14 @@ internal sealed class SharedFrameBuffer : IDisposable
         _view = _mapping.CreateViewAccessor(0, _capacity, MemoryMappedFileAccess.ReadWrite);
         _frameReady = new EventWaitHandle(false, EventResetMode.AutoReset, ReadyEventName);
         WriteStatus(0, 0, 0, 0, 0, 0);
+    }
+
+    public void SetTargetWindow(IntPtr handle, int processId)
+    {
+        _gameWindowHandle = handle.ToInt64();
+        _gameProcessId = processId;
+        WriteStatus(0, 0, 0, 0, 0, checked(Interlocked.Read(ref _frameId) * 2));
+        _view.Flush();
     }
 
     public void Publish(ReadOnlySpan<byte> bgra, int width, int height, int stride, long timestampTicks)
@@ -77,8 +87,11 @@ internal sealed class SharedFrameBuffer : IDisposable
         _view.Write(24, stride);
         _view.Write(28, payloadSize);
         _view.Write(32, timestampTicks);
-        _view.Write(40, Environment.ProcessId);
+        _view.Write(40, Environment.ProcessId); // capture-host PID
         _view.Write(44, HeaderSize);
+        _view.Write(48, _gameProcessId);         // actual MapleStory PID
+        _view.Write(52, 0);                      // reserved
+        _view.Write(56, _gameWindowHandle);      // actual HWND selected by WGC
     }
 
     public void Dispose()
