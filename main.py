@@ -14,7 +14,9 @@ from src.modules.data_recorder import DataRecorder
 from src.modules.gui import GUI
 from src.modules.listener import Listener
 from src.modules.notifier import Notifier
+from src.modules.patrol_controller import PatrolController
 from src.modules.scene_observer import SceneObserver
+from src.modules.scene_performance import install_scene_performance_patch
 from src.modules.wgc_capture_backend import install_wgc_capture
 
 
@@ -49,10 +51,12 @@ def main():
     install_wgc_capture(Capture)
     install_classic_vision_backend(Capture)
     install_classic_player_fallback(Capture)
+    install_scene_performance_patch(SceneObserver)
 
     bot = Bot()
     capture = Capture()
     scene_observer = SceneObserver()
+    patrol_controller = PatrolController()
     data_recorder = DataRecorder()
     notifier = Notifier()
     listener = Listener()
@@ -60,6 +64,7 @@ def main():
     _start_and_wait(bot, "Bot")
     _start_and_wait(capture, "Capture")
     _start_and_wait(scene_observer, "Scene Observer")
+    _start_and_wait(patrol_controller, "Patrol Controller")
     _start_and_wait(data_recorder, "Data Recorder")
     _start_and_wait(notifier, "Notifier")
     _start_and_wait(listener, "Listener")
@@ -68,8 +73,11 @@ def main():
     print("\n[~] Successfully initialized Auto Maple")
     print("[~] Capture backend: Windows Graphics Capture")
     print("[~] Minimap vision: Classic fixed-UI geometry / F11 manual search region")
-    print("[~] Main-scene vision: Monster 20Hz + Ladder/Platform 4Hz")
-    print("[~] F10 preview: combined Monster / Ladder / Platform cache (10Hz)")
+    print("[~] Main-scene vision: Monster 10Hz + Ladder/Platform 1Hz @ 480px FP16 on CUDA")
+    print("[~] Idle mode: main-scene YOLO sleeps until automation or F10 is enabled")
+    print("[~] F10 preview: combined Monster / Ladder / Platform cache (5Hz)")
+    print("[~] Patrol: Insert starts/stops; Shift attack; Space jump; Down+Space drop; rapid Z loot")
+    print("[~] Safety: patrol keys are sent only while MapleStory is the foreground window")
     print("[~] Press F8 to start dataset recording")
     print("[~] Press F9 to stop dataset recording")
     print("[~] Press F10 to toggle combined vision debug")
@@ -94,6 +102,12 @@ if __name__ == "__main__":
         print("\n[!] Auto Maple failed to start; see logs/auto-maple.log")
     finally:
         config.enabled = False
+        patrol = getattr(config, "patrol_controller", None)
+        if patrol is not None:
+            try:
+                patrol.stop()
+            except Exception:
+                logger.exception("Patrol controller shutdown failed")
         recorder = getattr(config, "data_recorder", None)
         if recorder is not None:
             try:
