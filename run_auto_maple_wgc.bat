@@ -26,12 +26,19 @@ if not exist "main.py" (
     exit /b 1
 )
 
+echo [~] Closing stale MapleCaptureHost processes...
+taskkill /F /IM MapleCaptureHost.exe /T >nul 2>&1
+rem Give Windows a moment to release the executable file lock.
+timeout /t 1 /nobreak >nul
+
 echo [~] Refreshing MapleCaptureHost...
 dotnet build capture_host\MapleCaptureHost.csproj -c Release --nologo
 if errorlevel 1 (
     echo.
     echo [ERROR] MapleCaptureHost build failed.
-    echo Make sure the .NET 8 SDK is installed.
+    echo If MSB3026/MSB3027 says the EXE is still in use, close all Auto Maple windows
+    echo and run this launcher again. The launcher now terminates stale capture hosts first.
+    echo.
     pause
     exit /b 1
 )
@@ -50,6 +57,9 @@ echo ========================================
 echo Auto Maple Python process has ended.
 echo Exit code: %EXIT_CODE%
 echo ========================================
+
+rem Make sure the hidden WGC helper cannot survive after Python exits/crashes.
+taskkill /F /IM MapleCaptureHost.exe /T >nul 2>&1
 
 if not "%EXIT_CODE%"=="0" goto :abnormal
 
