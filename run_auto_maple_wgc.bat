@@ -39,10 +39,10 @@ if not exist "capture_host\bin\Release\net8.0-windows10.0.19041.0\win-x64\MapleC
 
 echo [~] Python executable:
 echo     %CD%\.venv\Scripts\python.exe
-echo [~] Starting main.py...
+echo [~] Importing local main module explicitly...
 echo.
 
-".venv\Scripts\python.exe" -u main.py
+".venv\Scripts\python.exe" -u -X faulthandler -c "import os,sys,main; print('[DIAG] cwd:', os.getcwd()); print('[DIAG] python:', sys.executable); print('[DIAG] main module:', main.__file__); print('[DIAG] has main():', hasattr(main, 'main')); print('[DIAG] calling main.main() now...'); main.main(); print('[DIAG] main.main() returned normally')"
 set "EXIT_CODE=%ERRORLEVEL%"
 
 echo.
@@ -53,10 +53,12 @@ echo ========================================
 
 if not "%EXIT_CODE%"=="0" (
     echo [ERROR] Auto Maple exited abnormally.
-    echo Check logs\auto-maple.log for the traceback.
+    echo The traceback above is the primary diagnostic.
+    echo Also check logs\auto-maple.log if it exists.
 ) else (
     echo [INFO] Python returned exit code 0.
-    echo If the GUI did not open, main.py ended normally before entering the GUI loop.
+    echo If you saw '[DIAG] main.main() returned normally' without a GUI,
+    echo then the application startup path itself returned and must be fixed next.
 )
 
 echo.
