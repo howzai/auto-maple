@@ -6,24 +6,26 @@ if errorlevel 1 goto :badroot
 
 set "PY=.venv\Scripts\python.exe"
 if not exist "%PY%" goto :nopython
-if not exist "tools\test_combined_vision.py" goto :notool
+if not exist "tools\test_combined_vision_wgc.py" goto :notool
 if not exist "assets\models\classic_scene.pt" goto :nomonster
 if not exist "assets\models\navigation_scene.pt" goto :nonav
 
 echo.
 echo ========================================
-echo   Auto Maple Combined Vision Test
+echo   Auto Maple Combined WGC Vision Test
 echo ========================================
 echo.
 echo This test loads BOTH models:
 echo   - classic_scene.pt      = monster
 echo   - navigation_scene.pt   = ladder / platform
 echo.
+echo Capture: Windows Graphics Capture (no desktop recursion).
+echo Performance: monster every 2 frames, navigation every 5 frames.
 echo READ ONLY: no movement, attack, or key presses are sent to the game.
 echo Open MapleStory first. Press F10 or Esc in the preview window to close.
 echo.
 
-"%PY%" "tools\test_combined_vision.py"
+"%PY%" "tools\test_combined_vision_wgc.py"
 set "RC=%ERRORLEVEL%"
 if not "%RC%"=="0" goto :failed
 goto :done
@@ -35,7 +37,7 @@ set "RC=1"
 goto :done
 
 :notool
-echo [ERROR] tools\test_combined_vision.py was not found.
+echo [ERROR] tools\test_combined_vision_wgc.py was not found.
 set "RC=1"
 goto :done
 
@@ -56,7 +58,7 @@ goto :finish
 
 :failed
 echo.
-echo [ERROR] Combined vision test stopped. Error code: %RC%
+echo [ERROR] Combined WGC vision test stopped. Error code: %RC%
 
 :done
 popd >nul 2>&1
