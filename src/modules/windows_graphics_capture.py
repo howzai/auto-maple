@@ -20,8 +20,10 @@ import numpy as np
 MAPPING_NAME = r"Local\AutoMaple.GraphicsCapture.Frame"
 HEADER_SIZE = 64
 MAGIC = 0x50414D41
-VERSION = 1
-HEADER = struct.Struct("<IIqiiiiqii")
+VERSION = 2
+# magic, version, sequence, width, height, stride, payload, timestamp,
+# capture_host_pid, header_size, game_pid, reserved, game_hwnd
+HEADER = struct.Struct("<IIqiiiiqiiiiq")
 MAX_FRAME_BYTES = 2560 * 1440 * 4
 STALE_AFTER_SECONDS = 1.0
 WINDOWS_EPOCH_OFFSET_SECONDS = 11644473600.0
@@ -38,6 +40,8 @@ class SharedFrameInfo:
     timestamp_ticks: int
     producer_pid: int
     header_size: int
+    game_pid: int
+    game_hwnd: int
 
 
 class WindowsGraphicsCaptureReader:
@@ -51,6 +55,7 @@ class WindowsGraphicsCaptureReader:
         self.last_sequence = 0
         self.last_error: Optional[str] = None
         self.last_frame_time = 0.0
+        self.last_info: Optional[SharedFrameInfo] = None
         self._invalid_header_reads = 0
 
     @property
@@ -77,11 +82,11 @@ class WindowsGraphicsCaptureReader:
     def close(self) -> None:
         mapping, self._mapping = self._mapping, None
         self._invalid_header_reads = 0
+        self.last_info = None
         if mapping is not None:
             mapping.close()
 
     def _mark_invalid_header(self, message: str) -> None:
-        """Reconnect if Python attached before the host initialized the mapping."""
         self._invalid_header_reads += 1
         self.last_error = message
         if self._invalid_header_reads >= INVALID_HEADER_RECONNECTS:
@@ -98,7 +103,7 @@ class WindowsGraphicsCaptureReader:
             info1 = self._parse_header(first)
             if info1 is None:
                 self._mark_invalid_header(
-                    "Waiting for MapleCaptureHost to initialize shared memory"
+                    "Waiting for MapleCaptureHost v2 shared-memory header"
                 )
                 return None
             if info1.sequence <= 0 or info1.sequence % 2:
@@ -108,6 +113,7 @@ class WindowsGraphicsCaptureReader:
                 return None
 
             self._invalid_header_reads = 0
+            self.last_info = info1
             if info1.sequence == self.last_sequence:
                 return None
             if self._is_stale(info1.timestamp_ticks):
@@ -132,6 +138,7 @@ class WindowsGraphicsCaptureReader:
             packed = rows[:, : info2.width * 4]
             frame = packed.reshape((info2.height, info2.width, 4)).copy()
 
+            self.last_info = info2
             self.last_sequence = info2.sequence
             self.last_frame_time = time.monotonic()
             self.last_error = None
@@ -156,6 +163,9 @@ class WindowsGraphicsCaptureReader:
             timestamp_ticks,
             producer_pid,
             header_size,
+            game_pid,
+            _reserved,
+            game_hwnd,
         ) = HEADER.unpack_from(data)
 
         valid = (
@@ -168,6 +178,8 @@ class WindowsGraphicsCaptureReader:
             and payload_size == stride * height
             and payload_size <= MAX_FRAME_BYTES
             and producer_pid > 0
+            and game_pid > 0
+            and game_hwnd > 0
         )
         if not valid:
             return None
@@ -180,6 +192,8 @@ class WindowsGraphicsCaptureReader:
             timestamp_ticks=timestamp_ticks,
             producer_pid=producer_pid,
             header_size=header_size,
+            game_pid=game_pid,
+            game_hwnd=game_hwnd,
         )
 
     @staticmethod
