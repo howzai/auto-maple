@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+from ctypes import wintypes
 
 
 user32 = ctypes.windll.user32
@@ -19,6 +20,9 @@ VK_MAP = {
 }
 
 GAME_TITLE_KEYWORDS = ("maplestory", "楓之谷")
+GA_ROOT = 2
+GA_ROOTOWNER = 3
+GW_OWNER = 4
 
 
 def _window_process_id(hwnd: int) -> int:
@@ -40,9 +44,51 @@ def _window_title(hwnd: int) -> str:
     return buffer.value.strip()
 
 
+def _window_class(hwnd: int) -> str:
+    if not hwnd or not user32.IsWindow(hwnd):
+        return ""
+    buffer = ctypes.create_unicode_buffer(256)
+    if not user32.GetClassNameW(hwnd, buffer, len(buffer)):
+        return ""
+    return buffer.value.strip()
+
+
 def _title_is_maple(title: str) -> bool:
     normalized = (title or "").casefold()
     return bool(normalized and any(keyword.casefold() in normalized for keyword in GAME_TITLE_KEYWORDS))
+
+
+def _related_windows(hwnd: int):
+    """Return HWND plus its root/root-owner/owner chain, deduplicated."""
+    if not hwnd or not user32.IsWindow(hwnd):
+        return ()
+    result = []
+
+    def add(candidate):
+        candidate = int(candidate or 0)
+        if candidate and user32.IsWindow(candidate) and candidate not in result:
+            result.append(candidate)
+
+    add(hwnd)
+    add(user32.GetAncestor(hwnd, GA_ROOT))
+    add(user32.GetAncestor(hwnd, GA_ROOTOWNER))
+
+    current = hwnd
+    for _ in range(8):
+        owner = int(user32.GetWindow(current, GW_OWNER) or 0)
+        if not owner or owner == current:
+            break
+        add(owner)
+        current = owner
+
+    return tuple(result)
+
+
+def _describe(hwnd: int) -> str:
+    return (
+        f"hwnd={int(hwnd or 0)} pid={_window_process_id(hwnd)} "
+        f"class={_window_class(hwnd)!r} title={_window_title(hwnd)!r}"
+    )
 
 
 def install_listener_hotkey_patch(listener_class) -> None:
@@ -73,13 +119,7 @@ def install_listener_hotkey_patch(listener_class) -> None:
 
 
 def install_patrol_focus_patch(patrol_class) -> None:
-    """Allow patrol input only while the foreground window is MapleStory.
-
-    The classic client may recreate its HWND or expose a foreground top-level
-    window whose PID differs from the stale handle WGC originally selected. We
-    therefore accept, in order: exact HWND, same process, or an explicit
-    MapleStory window title. CMD/browser/Desktop remain rejected.
-    """
+    """Allow patrol input only while foreground belongs to the MapleStory window family."""
     if getattr(patrol_class, "_process_focus_patch_installed", False):
         return
 
@@ -95,19 +135,41 @@ def install_patrol_focus_patch(patrol_class) -> None:
         if not foreground or not user32.IsWindow(foreground):
             return False
 
-        if game_hwnd and user32.IsWindow(game_hwnd):
-            if foreground == game_hwnd:
-                return True
+        foreground_family = _related_windows(foreground)
+        game_family = _related_windows(game_hwnd)
 
-            game_pid = _window_process_id(game_hwnd)
-            foreground_pid = _window_process_id(foreground)
-            if game_pid and foreground_pid and game_pid == foreground_pid:
-                return True
+        # Direct/root/owner relationship catches games that expose a child or
+        # owned top-level window as the foreground HWND.
+        if set(foreground_family).intersection(game_family):
+            return True
 
-        # Conservative fallback for the classic client. The actual foreground
-        # window itself must identify as MapleStory; unrelated applications are
-        # never accepted merely because the stored capture handle became stale.
-        return _title_is_maple(_window_title(foreground))
+        game_pids = {_window_process_id(hwnd) for hwnd in game_family}
+        game_pids.discard(0)
+        foreground_pids = {_window_process_id(hwnd) for hwnd in foreground_family}
+        foreground_pids.discard(0)
+        if game_pids.intersection(foreground_pids):
+            return True
+
+        # Check every related foreground title, not just GetForegroundWindow().
+        # Some classic DirectX clients expose an untitled child while the root
+        # owner carries the visible MapleStory title.
+        if any(_title_is_maple(_window_title(hwnd)) for hwnd in foreground_family):
+            return True
+
+        return False
+
+    def focus_debug_text() -> str:
+        from src.common import config
+
+        capture = getattr(config, "capture", None)
+        game_hwnd = int(getattr(capture, "_handle", 0) or 0) if capture is not None else 0
+        foreground = int(user32.GetForegroundWindow() or 0)
+        fg_family = _related_windows(foreground)
+        game_family = _related_windows(game_hwnd)
+        fg_text = "; ".join(_describe(hwnd) for hwnd in fg_family) or "none"
+        game_text = "; ".join(_describe(hwnd) for hwnd in game_family) or "none"
+        return f"foreground=[{fg_text}] captured=[{game_text}]"
 
     patrol_class._foreground_is_game = staticmethod(foreground_is_game)
+    patrol_class._focus_debug_text = staticmethod(focus_debug_text)
     patrol_class._process_focus_patch_installed = True
