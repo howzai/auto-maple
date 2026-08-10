@@ -68,10 +68,12 @@ internal static class Program
             return 3;
         }
 
+        output.SetTargetWindow(window.Handle, window.ProcessId);
+
         Console.WriteLine(
             $"Target window found: '{window.Title}' " +
-            $"process={window.ProcessName} size={window.Width}x{window.Height} " +
-            $"HWND=0x{window.Handle.ToInt64():X}"
+            $"process={window.ProcessName} pid={window.ProcessId} " +
+            $"size={window.Width}x{window.Height} HWND=0x{window.Handle.ToInt64():X}"
         );
         Console.WriteLine("Starting Windows Graphics Capture. Press Ctrl+C to stop.");
 
@@ -119,7 +121,8 @@ internal static class Program
                 return true;
             }
 
-            var processName = GetProcessName(handle);
+            var processId = GetProcessId(handle);
+            var processName = GetProcessName(processId);
             if (RejectedProcessNames.Any(name =>
                     processName.Equals(name, StringComparison.OrdinalIgnoreCase)))
             {
@@ -134,7 +137,6 @@ internal static class Program
             var width = Math.Max(0, rect.Right - rect.Left);
             var height = Math.Max(0, rect.Bottom - rect.Top);
 
-            // Reject splash windows, launchers, thumbnails and transitional windows.
             if (width < 800 || height < 500)
             {
                 return true;
@@ -144,25 +146,17 @@ internal static class Program
             var mapleProcess = AllowedProcessNames.Any(name =>
                 processName.Equals(name, StringComparison.OrdinalIgnoreCase));
 
-            // A valid target must either have the exact game title or be a known
-            // MapleStory executable whose title starts with the game name.
             if (!exactTitle && !(mapleProcess && title.StartsWith("新楓之谷", StringComparison.OrdinalIgnoreCase)))
             {
                 return true;
             }
 
             var score = 0;
-            if (exactTitle)
-            {
-                score += 1000;
-            }
-            if (mapleProcess)
-            {
-                score += 2000;
-            }
+            if (exactTitle) score += 1000;
+            if (mapleProcess) score += 2000;
             score += Math.Min(width * height / 1000, 1500);
 
-            matches.Add(new WindowMatch(handle, title, processName, width, height, score));
+            matches.Add(new WindowMatch(handle, title, processName, processId, width, height, score));
             return true;
         }, IntPtr.Zero);
 
@@ -172,17 +166,22 @@ internal static class Program
             .FirstOrDefault();
     }
 
-    private static string GetProcessName(IntPtr handle)
+    private static int GetProcessId(IntPtr handle)
     {
         _ = GetWindowThreadProcessId(handle, out var processId);
-        if (processId == 0)
+        return checked((int)processId);
+    }
+
+    private static string GetProcessName(int processId)
+    {
+        if (processId <= 0)
         {
             return string.Empty;
         }
 
         try
         {
-            using var process = Process.GetProcessById((int)processId);
+            using var process = Process.GetProcessById(processId);
             return process.ProcessName;
         }
         catch
@@ -195,6 +194,7 @@ internal static class Program
         IntPtr Handle,
         string Title,
         string ProcessName,
+        int ProcessId,
         int Width,
         int Height,
         int Score
