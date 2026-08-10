@@ -1,9 +1,8 @@
 """Performance tuning for the combined scene observer.
 
 The classic client should remain responsive while Auto Maple is idle and while
-patrol is active.  This patch keeps WGC running, but avoids expensive YOLO work
-until automation or F10 debug is actually enabled.  On CUDA devices it also uses
-FP16 inference.
+patrol is active. This patch keeps WGC running, but avoids expensive YOLO work
+until automation or F10 debug is actually enabled.
 """
 
 from __future__ import annotations
@@ -31,7 +30,7 @@ def install_scene_performance_patch(scene_observer_class) -> None:
 
     def observe_only_when_needed(self):
         # WGC/minimap tracking remain live, but main-scene YOLO sleeps while the
-        # bot is idle.  F10 can still explicitly wake it for diagnostics.
+        # bot is idle. F10 can still explicitly wake it for diagnostics.
         if not config.enabled and not self.debug_enabled:
             return
         return original_observe_once(self)
@@ -40,13 +39,14 @@ def install_scene_performance_patch(scene_observer_class) -> None:
     def predict_optimized(model, frame, confidence, device):
         bgr = frame[:, :, :3]
         started = time.perf_counter()
-        use_half = str(device) != "cpu"
+        # Do not pass Ultralytics' deprecated ``half`` argument.  The lower
+        # inference size/rates provide the primary performance win and avoid
+        # flooding the console with a warning on every prediction.
         results = model.predict(
             bgr,
             imgsz=scene_observer_class.IMAGE_SIZE,
             conf=confidence,
             device=device,
-            half=use_half,
             verbose=False,
         )
         return results, (time.perf_counter() - started) * 1000.0
