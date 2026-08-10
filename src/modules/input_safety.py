@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ctypes
-from ctypes import wintypes
 
 
 user32 = ctypes.windll.user32
@@ -59,7 +58,6 @@ def _title_is_maple(title: str) -> bool:
 
 
 def _related_windows(hwnd: int):
-    """Return HWND plus its root/root-owner/owner chain, deduplicated."""
     if not hwnd or not user32.IsWindow(hwnd):
         return ()
     result = []
@@ -86,13 +84,12 @@ def _related_windows(hwnd: int):
 
 def _describe(hwnd: int) -> str:
     return (
-        f"hwnd={int(hwnd or 0)} pid={_window_process_id(hwnd)} "
+        f"hwnd=0x{int(hwnd or 0):X} pid={_window_process_id(hwnd)} "
         f"class={_window_class(hwnd)!r} title={_window_title(hwnd)!r}"
     )
 
 
 def install_listener_hotkey_patch(listener_class) -> None:
-    """Use GetAsyncKeyState for control hotkeys, preserving edge detection."""
     if getattr(listener_class, "_async_hotkey_patch_installed", False):
         return
 
@@ -119,7 +116,7 @@ def install_listener_hotkey_patch(listener_class) -> None:
 
 
 def install_patrol_focus_patch(patrol_class) -> None:
-    """Allow patrol input only while foreground belongs to the MapleStory window family."""
+    """Trust the exact HWND/PID selected by MapleCaptureHost, not a guessed Python HWND."""
     if getattr(patrol_class, "_process_focus_patch_installed", False):
         return
 
@@ -130,45 +127,45 @@ def install_patrol_focus_patch(patrol_class) -> None:
         if capture is None:
             return False
 
-        game_hwnd = int(getattr(capture, "_handle", 0) or 0)
+        game_hwnd = int(getattr(capture, "_capture_target_hwnd", 0) or 0)
+        game_pid = int(getattr(capture, "_capture_target_pid", 0) or 0)
         foreground = int(user32.GetForegroundWindow() or 0)
         if not foreground or not user32.IsWindow(foreground):
             return False
 
         foreground_family = _related_windows(foreground)
-        game_family = _related_windows(game_hwnd)
 
-        # Direct/root/owner relationship catches games that expose a child or
-        # owned top-level window as the foreground HWND.
-        if set(foreground_family).intersection(game_family):
-            return True
+        # Primary safety path: use the exact game identity published by the C#
+        # process that actually selected the WGC target window.
+        if game_hwnd:
+            game_family = _related_windows(game_hwnd)
+            if set(foreground_family).intersection(game_family):
+                return True
 
-        game_pids = {_window_process_id(hwnd) for hwnd in game_family}
-        game_pids.discard(0)
-        foreground_pids = {_window_process_id(hwnd) for hwnd in foreground_family}
-        foreground_pids.discard(0)
-        if game_pids.intersection(foreground_pids):
-            return True
+        if game_pid:
+            foreground_pids = {_window_process_id(hwnd) for hwnd in foreground_family}
+            foreground_pids.discard(0)
+            if game_pid in foreground_pids:
+                return True
 
-        # Check every related foreground title, not just GetForegroundWindow().
-        # Some classic DirectX clients expose an untitled child while the root
-        # owner carries the visible MapleStory title.
-        if any(_title_is_maple(_window_title(hwnd)) for hwnd in foreground_family):
-            return True
-
-        return False
+        # Conservative fallback only while the shared identity is not available
+        # yet. The visible foreground family itself must identify as MapleStory.
+        return any(_title_is_maple(_window_title(hwnd)) for hwnd in foreground_family)
 
     def focus_debug_text() -> str:
         from src.common import config
 
         capture = getattr(config, "capture", None)
-        game_hwnd = int(getattr(capture, "_handle", 0) or 0) if capture is not None else 0
+        game_hwnd = int(getattr(capture, "_capture_target_hwnd", 0) or 0) if capture is not None else 0
+        game_pid = int(getattr(capture, "_capture_target_pid", 0) or 0) if capture is not None else 0
         foreground = int(user32.GetForegroundWindow() or 0)
         fg_family = _related_windows(foreground)
-        game_family = _related_windows(game_hwnd)
         fg_text = "; ".join(_describe(hwnd) for hwnd in fg_family) or "none"
-        game_text = "; ".join(_describe(hwnd) for hwnd in game_family) or "none"
-        return f"foreground=[{fg_text}] captured=[{game_text}]"
+        game_text = _describe(game_hwnd) if game_hwnd else "none"
+        return (
+            f"foreground=[{fg_text}] "
+            f"wgc_target=[{game_text}] shared_game_pid={game_pid}"
+        )
 
     patrol_class._foreground_is_game = staticmethod(foreground_is_game)
     patrol_class._focus_debug_text = staticmethod(focus_debug_text)
