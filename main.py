@@ -68,10 +68,11 @@ def main():
     print("\n[~] Successfully initialized Auto Maple")
     print("[~] Capture backend: Windows Graphics Capture")
     print("[~] Minimap vision: Classic fixed-UI geometry / F11 manual search region")
-    print("[~] Main-scene vision: Observation only / optional YOLO")
+    print("[~] Main-scene vision: Monster 20Hz + Ladder/Platform 4Hz")
+    print("[~] F10 preview: combined Monster / Ladder / Platform cache (10Hz)")
     print("[~] Press F8 to start dataset recording")
     print("[~] Press F9 to stop dataset recording")
-    print("[~] Press F10 to toggle vision debug data")
+    print("[~] Press F10 to toggle combined vision debug")
     print("[~] Press F11 to draw/save the minimap search region")
     print("[~] Press F12 at any time for emergency stop")
 
