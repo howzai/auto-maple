@@ -12,6 +12,7 @@ from src.modules.classic_vision_backend import install_classic_vision_backend
 from src.modules.classic_player import install_classic_player_fallback
 from src.modules.data_recorder import DataRecorder
 from src.modules.gui import GUI
+from src.modules.input_safety import install_listener_hotkey_patch, install_patrol_focus_patch
 from src.modules.listener import Listener
 from src.modules.notifier import Notifier
 from src.modules.patrol_controller import PatrolController
@@ -35,9 +36,7 @@ def _start_and_wait(component, display_name, timeout=STARTUP_TIMEOUT_SECONDS):
         if thread is not None and not thread.is_alive():
             raise RuntimeError(f"{display_name} stopped during initialization")
         if time.monotonic() >= deadline:
-            raise TimeoutError(
-                f"{display_name} did not become ready within {timeout} seconds"
-            )
+            raise TimeoutError(f"{display_name} did not become ready within {timeout} seconds")
         time.sleep(0.02)
 
     logger.info("%s is ready", display_name)
@@ -52,6 +51,8 @@ def main():
     install_classic_vision_backend(Capture)
     install_classic_player_fallback(Capture)
     install_scene_performance_patch(SceneObserver)
+    install_listener_hotkey_patch(Listener)
+    install_patrol_focus_patch(PatrolController)
 
     bot = Bot()
     capture = Capture()
@@ -73,11 +74,11 @@ def main():
     print("\n[~] Successfully initialized Auto Maple")
     print("[~] Capture backend: Windows Graphics Capture")
     print("[~] Minimap vision: Classic fixed-UI geometry / F11 manual search region")
-    print("[~] Main-scene vision: Monster 10Hz + Ladder/Platform 1Hz @ 480px FP16 on CUDA")
+    print("[~] Main-scene vision: Monster 10Hz + Ladder/Platform 1Hz @ 480px")
     print("[~] Idle mode: main-scene YOLO sleeps until automation or F10 is enabled")
     print("[~] F10 preview: combined Monster / Ladder / Platform cache (5Hz)")
     print("[~] Patrol: Insert starts/stops; Shift attack; Space jump; Down+Space drop; rapid Z loot")
-    print("[~] Safety: patrol keys are sent only while MapleStory is the foreground window")
+    print("[~] Safety: patrol keys are sent only to the foreground MapleStory process")
     print("[~] Press F8 to start dataset recording")
     print("[~] Press F9 to stop dataset recording")
     print("[~] Press F10 to toggle combined vision debug")
