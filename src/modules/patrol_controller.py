@@ -90,6 +90,10 @@ class PatrolController:
         except Exception:
             return False
 
+    @staticmethod
+    def _focus_debug_text() -> str:
+        return "focus diagnostics unavailable"
+
     def _safe_press(self, key: str, down_time: float = 0.04, up_time: float = 0.02) -> bool:
         if not config.enabled or not self._foreground_is_game():
             return False
@@ -123,9 +127,6 @@ class PatrolController:
             if frame is None:
                 return None
             height, width = frame.shape[:2]
-        # The classic camera keeps the local character near screen center.  This
-        # is the current character anchor until the scene model gains a dedicated
-        # player class; all monster ranges are measured from this one point.
         return width // 2, height // 2
 
     @staticmethod
@@ -163,8 +164,6 @@ class PatrolController:
             if self._previous_monster_distance is not None and distance is not None:
                 jumped = distance - self._previous_monster_distance
                 if jumped >= self.KNOCKBACK_PIXEL_JUMP:
-                    # A sudden increase usually means the character was knocked
-                    # back. Keep combat locked instead of incorrectly resuming patrol.
                     self._combat_lock_until = max(
                         self._combat_lock_until, now + self.COMBAT_REACQUIRE_GRACE
                     )
@@ -183,8 +182,6 @@ class PatrolController:
             self._state = "combat"
             return True
 
-        # The target can briefly disappear behind hit effects or during knockback.
-        # Continue swinging for a short grace period before patrol resumes.
         if now < self._combat_lock_until:
             if now - self._last_attack >= self.ATTACK_INTERVAL:
                 self._safe_press(self.ATTACK_KEY, down_time=0.055, up_time=0.025)
@@ -198,7 +195,6 @@ class PatrolController:
     def _rapid_loot(self, now: float) -> None:
         if now - self._last_loot < self.LOOT_INTERVAL:
             return
-        # Deliberately repeated taps, never a held Z key.
         self._safe_press(self.LOOT_KEY, down_time=0.025, up_time=0.025)
         self._last_loot = now
 
@@ -234,7 +230,6 @@ class PatrolController:
 
         before = self._minimap_player()
         self._state = "climb-ladder"
-        # User-specified sequence: jump, then immediately Up to catch ladder.
         if not self._safe_combo(self.JUMP_KEY, "up", first_lead=0.025, hold=0.11):
             return False
         for _ in range(5):
@@ -290,7 +285,6 @@ class PatrolController:
             self._state = "level-changed"
             return True
 
-        # No usable vertical route at this edge: turn around instead of getting stuck.
         self._patrol_direction = "left" if self._patrol_direction == "right" else "right"
         self._state = "edge-turnaround"
         return True
@@ -319,11 +313,14 @@ class PatrolController:
                     continue
 
                 if not self._foreground_is_game():
-                    # Do not send anything to Desktop, browser, CMD, or any other app.
                     release_all()
                     now = time.monotonic()
                     if now - self._last_focus_warning >= 3.0:
                         print("\n[~] Patrol paused: MapleStory is not the foreground window")
+                        try:
+                            print(f"[FOCUS] {self._focus_debug_text()}")
+                        except Exception as exc:
+                            print(f"[FOCUS] diagnostic failed: {type(exc).__name__}: {exc}")
                         self._last_focus_warning = now
                     time.sleep(0.08)
                     continue
