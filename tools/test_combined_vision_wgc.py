@@ -1,7 +1,7 @@
 """Low-latency read-only combined vision test using Windows Graphics Capture.
 
 This tester reads MapleStory frames directly from MapleCaptureHost shared memory,
-so its own preview window is never captured recursively.  Monster inference runs
+so its own preview window is never captured recursively. Monster inference runs
 more often than navigation inference because ladders/platforms are effectively
 static scene geometry.
 
@@ -15,6 +15,7 @@ No game keys are ever sent. Press F10 or Escape to close.
 from __future__ import annotations
 
 import argparse
+import sys
 import time
 from pathlib import Path
 import tkinter as tk
@@ -24,10 +25,15 @@ import cv2
 import numpy as np
 from PIL import Image, ImageTk
 
+# When this script is launched directly from tools/, Python only adds the tools
+# directory to sys.path. Add the project root before importing src.* modules.
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 from src.modules.windows_graphics_capture import WindowsGraphicsCaptureReader
 from src.modules.wgc_capture_backend import CaptureHostController
 
-ROOT = Path(__file__).resolve().parents[1]
 MONSTER_MODEL = ROOT / "assets" / "models" / "classic_scene.pt"
 NAV_MODEL = ROOT / "assets" / "models" / "navigation_scene.pt"
 
