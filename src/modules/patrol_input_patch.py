@@ -1,0 +1,93 @@
+"""Install exact-window patrol input for the classic client.
+
+The WGC host already publishes the precise MapleStory HWND.  Patrol therefore no
+longer depends on Windows foreground ownership (which is unreliable for this
+classic Unity window).  Every patrol keystroke is posted only to that exact game
+HWND, so Terminal/Chrome/Desktop never receive it.
+"""
+
+from __future__ import annotations
+
+import ctypes
+import time
+from ctypes import wintypes
+
+from src.common import config
+from src.modules import game_input
+
+
+user32 = ctypes.WinDLL("user32", use_last_error=True)
+user32.IsWindow.argtypes = (wintypes.HWND,)
+user32.IsWindow.restype = wintypes.BOOL
+
+
+def _game_target_ready() -> bool:
+    capture = getattr(config, "capture", None)
+    if capture is None:
+        return False
+    hwnd = int(getattr(capture, "_capture_target_hwnd", 0) or 0)
+    return bool(hwnd and user32.IsWindow(wintypes.HWND(hwnd)))
+
+
+def install_patrol_input_patch(patrol_class) -> None:
+    if getattr(patrol_class, "_targeted_input_patch_installed", False):
+        return
+
+    # Existing patrol loop calls this before doing any work.  With targeted
+    # PostMessage input the relevant safety condition is that the exact WGC game
+    # HWND still exists, not which unrelated window Windows reports as foreground.
+    patrol_class._foreground_is_game = staticmethod(_game_target_ready)
+
+    def safe_press(self, key: str, down_time: float = 0.04, up_time: float = 0.02) -> bool:
+        if not config.enabled or not _game_target_ready():
+            return False
+        return game_input.press(key, 1, down_time=down_time, up_time=up_time)
+
+    def safe_combo(self, first: str, second: str, first_lead: float = 0.025, hold: float = 0.08) -> bool:
+        if not config.enabled or not _game_target_ready():
+            return False
+        return game_input.combo(first, second, first_lead=first_lead, hold=hold)
+
+    patrol_class._safe_press = safe_press
+    patrol_class._safe_combo = safe_combo
+
+    # A 55 ms Shift pulse was too short for the classic bow skill and could show
+    # only the bow-swing animation.  Use a more physical key press cadence.
+    patrol_class.ATTACK_INTERVAL = 0.24
+    patrol_class.ATTACK_KEY_DOWN_TIME = 0.12
+
+    original_combat = patrol_class._combat
+
+    def combat_with_stable_attack(self, snapshot, anchor, now: float) -> bool:
+        # Temporarily intercept _safe_press only for Shift so the existing combat
+        # targeting/knockback logic remains unchanged while attack timing is fixed.
+        original_safe = self._safe_press
+
+        def timed_safe(key: str, down_time: float = 0.04, up_time: float = 0.02):
+            if str(key).lower() == self.ATTACK_KEY:
+                return game_input.press(
+                    self.ATTACK_KEY,
+                    1,
+                    down_time=self.ATTACK_KEY_DOWN_TIME,
+                    up_time=0.04,
+                )
+            return original_safe(key, down_time=down_time, up_time=up_time)
+
+        self._safe_press = timed_safe
+        try:
+            return original_combat(self, snapshot, anchor, now)
+        finally:
+            self._safe_press = original_safe
+
+    patrol_class._combat = combat_with_stable_attack
+
+    original_stop = patrol_class.stop
+
+    def stop(self):
+        try:
+            game_input.release_all()
+        finally:
+            original_stop(self)
+
+    patrol_class.stop = stop
+    patrol_class._targeted_input_patch_installed = True
