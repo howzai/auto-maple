@@ -3,11 +3,23 @@ setlocal EnableExtensions
 cd /d "%~dp0"
 title Auto Maple - Windows Graphics Capture
 
+rem MapleStory may run at a higher integrity level than a normal terminal.
+rem SendInput is blocked by Windows UIPI in that case, so relaunch this exact
+rem launcher as Administrator once.  The UAC prompt is expected.
+net session >nul 2>&1
+if not "%errorlevel%"=="0" (
+    echo [~] Administrator privileges are required for game keyboard input.
+    echo [~] Requesting elevation...
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath '%~f0' -WorkingDirectory '%~dp0' -Verb RunAs"
+    exit /b
+)
+
 echo.
 echo ========================================
 echo   Auto Maple - Windows Graphics Capture
 echo ========================================
 echo Project: %CD%
+echo Input privilege: Administrator
 echo.
 
 if not exist ".venv\Scripts\python.exe" (
@@ -28,7 +40,6 @@ if not exist "main.py" (
 
 echo [~] Closing stale MapleCaptureHost processes...
 taskkill /F /IM MapleCaptureHost.exe /T >nul 2>&1
-rem Give Windows a moment to release the executable file lock.
 timeout /t 1 /nobreak >nul
 
 echo [~] Refreshing MapleCaptureHost...
@@ -37,7 +48,7 @@ if errorlevel 1 (
     echo.
     echo [ERROR] MapleCaptureHost build failed.
     echo If MSB3026/MSB3027 says the EXE is still in use, close all Auto Maple windows
-    echo and run this launcher again. The launcher now terminates stale capture hosts first.
+    echo and run this launcher again.
     echo.
     pause
     exit /b 1
@@ -58,7 +69,6 @@ echo Auto Maple Python process has ended.
 echo Exit code: %EXIT_CODE%
 echo ========================================
 
-rem Make sure the hidden WGC helper cannot survive after Python exits/crashes.
 taskkill /F /IM MapleCaptureHost.exe /T >nul 2>&1
 
 if not "%EXIT_CODE%"=="0" goto :abnormal
