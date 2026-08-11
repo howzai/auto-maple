@@ -16,6 +16,7 @@ from src.modules.input_safety import install_listener_hotkey_patch, install_patr
 from src.modules.listener import Listener
 from src.modules.notifier import Notifier
 from src.modules.patrol_controller import PatrolController
+from src.modules.patrol_input_patch import install_patrol_input_patch
 from src.modules.scene_observer import SceneObserver
 from src.modules.scene_performance import install_scene_performance_patch
 from src.modules.wgc_capture_backend import install_wgc_capture
@@ -53,6 +54,7 @@ def main():
     install_scene_performance_patch(SceneObserver)
     install_listener_hotkey_patch(Listener)
     install_patrol_focus_patch(PatrolController)
+    install_patrol_input_patch(PatrolController)
 
     bot = Bot()
     capture = Capture()
@@ -78,7 +80,7 @@ def main():
     print("[~] Idle mode: main-scene YOLO sleeps until automation or F10 is enabled")
     print("[~] F10 preview: combined Monster / Ladder / Platform cache (5Hz)")
     print("[~] Patrol: Insert starts/stops; Shift attack; Space jump; Down+Space drop; rapid Z loot")
-    print("[~] Safety: patrol keys are sent only to the foreground MapleStory process")
+    print("[~] Safety: patrol keys are posted only to the exact WGC MapleStory HWND")
     print("[~] Press F8 to start dataset recording")
     print("[~] Press F9 to stop dataset recording")
     print("[~] Press F10 to toggle combined vision debug")
