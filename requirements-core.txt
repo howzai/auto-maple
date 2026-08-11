@@ -8,4 +8,5 @@ numpy>=2.0,<3
 opencv-python-headless>=4.10,<5
 Pillow>=11,<13
 pygame>=2.6,<3
+pyserial>=3.5,<4
 pywin32>=308
