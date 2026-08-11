@@ -1,15 +1,8 @@
-"""Install exact-window patrol input for the classic client.
-
-The WGC host already publishes the precise MapleStory HWND.  Patrol therefore no
-longer depends on Windows foreground ownership (which is unreliable for this
-classic Unity window).  Every patrol keystroke is posted only to that exact game
-HWND, so Terminal/Chrome/Desktop never receive it.
-"""
+"""Route patrol key actions through the USB HID keyboard bridge."""
 
 from __future__ import annotations
 
 import ctypes
-import time
 from ctypes import wintypes
 
 from src.common import config
@@ -33,34 +26,26 @@ def install_patrol_input_patch(patrol_class) -> None:
     if getattr(patrol_class, "_targeted_input_patch_installed", False):
         return
 
-    # Existing patrol loop calls this before doing any work.  With targeted
-    # PostMessage input the relevant safety condition is that the exact WGC game
-    # HWND still exists, not which unrelated window Windows reports as foreground.
-    patrol_class._foreground_is_game = staticmethod(_game_target_ready)
-
     def safe_press(self, key: str, down_time: float = 0.04, up_time: float = 0.02) -> bool:
-        if not config.enabled or not _game_target_ready():
+        if not config.enabled or not _game_target_ready() or not game_input.is_ready():
             return False
         return game_input.press(key, 1, down_time=down_time, up_time=up_time)
 
     def safe_combo(self, first: str, second: str, first_lead: float = 0.025, hold: float = 0.08) -> bool:
-        if not config.enabled or not _game_target_ready():
+        if not config.enabled or not _game_target_ready() or not game_input.is_ready():
             return False
         return game_input.combo(first, second, first_lead=first_lead, hold=hold)
 
     patrol_class._safe_press = safe_press
     patrol_class._safe_combo = safe_combo
 
-    # A 55 ms Shift pulse was too short for the classic bow skill and could show
-    # only the bow-swing animation.  Use a more physical key press cadence.
+    # Stable bow cadence; actual key report is emitted by the HID device.
     patrol_class.ATTACK_INTERVAL = 0.24
     patrol_class.ATTACK_KEY_DOWN_TIME = 0.12
 
     original_combat = patrol_class._combat
 
     def combat_with_stable_attack(self, snapshot, anchor, now: float) -> bool:
-        # Temporarily intercept _safe_press only for Shift so the existing combat
-        # targeting/knockback logic remains unchanged while attack timing is fixed.
         original_safe = self._safe_press
 
         def timed_safe(key: str, down_time: float = 0.04, up_time: float = 0.02):
