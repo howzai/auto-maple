@@ -3,23 +3,12 @@ setlocal EnableExtensions
 cd /d "%~dp0"
 title Auto Maple - Windows Graphics Capture
 
-rem MapleStory may run at a higher integrity level than a normal terminal.
-rem SendInput is blocked by Windows UIPI in that case, so relaunch this exact
-rem launcher as Administrator once.  The UAC prompt is expected.
-net session >nul 2>&1
-if not "%errorlevel%"=="0" (
-    echo [~] Administrator privileges are required for game keyboard input.
-    echo [~] Requesting elevation...
-    powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath '%~f0' -WorkingDirectory '%~dp0' -Verb RunAs"
-    exit /b
-)
-
 echo.
 echo ========================================
 echo   Auto Maple - Windows Graphics Capture
 echo ========================================
 echo Project: %CD%
-echo Input privilege: Administrator
+echo Input backend: USB HID keyboard bridge
 echo.
 
 if not exist ".venv\Scripts\python.exe" (
@@ -58,6 +47,7 @@ echo [~] Python executable:
 echo     %CD%\.venv\Scripts\python.exe
 echo [~] Starting local main.py directly...
 echo [~] F10 uses the production combined Monster / Ladder / Platform observer.
+echo [~] Patrol requires a flashed Auto Maple USB HID board.
 echo.
 
 ".venv\Scripts\python.exe" -u -X faulthandler "main.py"
