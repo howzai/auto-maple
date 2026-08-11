@@ -1,202 +1,220 @@
-"""Safe keyboard input for the exact MapleStory WGC target.
+"""USB HID keyboard backend for Auto Maple.
 
-The classic Unity client ignores WM_KEYDOWN/WM_KEYUP posted with PostMessage.
-Instead, focus the exact HWND published by MapleCaptureHost and inject hardware-like
-scan-code events with SendInput.  No event is sent unless that exact game window
-can be made the active foreground target at send time.
+The Windows synthetic-input experiments (PostMessage/keybd_event/SendInput) are
+not used here.  Patrol commands are sent over a serial link to a small USB HID
+microcontroller (for example an ATmega32U4 Pro Micro/Leonardo).  The device then
+emits normal USB keyboard reports.
+
+Safety remains in PatrolController/manual_foreground_input: commands are only
+issued while the captured MapleStory window is the active application.
 """
 
 from __future__ import annotations
 
-import ctypes
+import os
 import threading
 import time
-from ctypes import wintypes
+from typing import Optional
 
-from src.common import config
-
-user32 = ctypes.WinDLL("user32", use_last_error=True)
-kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-
-INPUT_KEYBOARD = 1
-KEYEVENTF_KEYUP = 0x0002
-KEYEVENTF_SCANCODE = 0x0008
-KEYEVENTF_EXTENDEDKEY = 0x0001
-SW_RESTORE = 9
-
-# Set-1 keyboard scan codes.  These are what DirectInput-style games expect.
-SCAN = {
-    "left": 0x4B,
-    "up": 0x48,
-    "right": 0x4D,
-    "down": 0x50,
-    "shift": 0x2A,   # left Shift
-    "space": 0x39,
-    "z": 0x2C,
-}
-EXTENDED_KEYS = {"left", "up", "right", "down"}
-
-wintypes.ULONG_PTR = wintypes.WPARAM
+try:
+    import serial
+    from serial.tools import list_ports
+except Exception:  # setup may not have installed pyserial yet
+    serial = None
+    list_ports = None
 
 
-class KEYBDINPUT(ctypes.Structure):
-    _fields_ = [
-        ("wVk", wintypes.WORD),
-        ("wScan", wintypes.WORD),
-        ("dwFlags", wintypes.DWORD),
-        ("time", wintypes.DWORD),
-        ("dwExtraInfo", wintypes.ULONG_PTR),
-    ]
+BAUDRATE = 115200
+PROTOCOL = "AUTO_MAPLE_HID_V1"
+VALID_KEYS = {"left", "right", "up", "down", "shift", "space", "z"}
 
-
-class _INPUTUNION(ctypes.Union):
-    _fields_ = [("ki", KEYBDINPUT)]
-
-
-class INPUT(ctypes.Structure):
-    _anonymous_ = ("u",)
-    _fields_ = [("type", wintypes.DWORD), ("u", _INPUTUNION)]
-
-
-user32.SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int)
-user32.SendInput.restype = wintypes.UINT
-user32.GetForegroundWindow.argtypes = ()
-user32.GetForegroundWindow.restype = wintypes.HWND
-user32.IsWindow.argtypes = (wintypes.HWND,)
-user32.IsWindow.restype = wintypes.BOOL
-user32.IsIconic.argtypes = (wintypes.HWND,)
-user32.IsIconic.restype = wintypes.BOOL
-user32.ShowWindow.argtypes = (wintypes.HWND, ctypes.c_int)
-user32.ShowWindow.restype = wintypes.BOOL
-user32.SetForegroundWindow.argtypes = (wintypes.HWND,)
-user32.SetForegroundWindow.restype = wintypes.BOOL
-user32.BringWindowToTop.argtypes = (wintypes.HWND,)
-user32.BringWindowToTop.restype = wintypes.BOOL
-user32.SetActiveWindow.argtypes = (wintypes.HWND,)
-user32.SetActiveWindow.restype = wintypes.HWND
-user32.SetFocus.argtypes = (wintypes.HWND,)
-user32.SetFocus.restype = wintypes.HWND
-user32.GetWindowThreadProcessId.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.DWORD))
-user32.GetWindowThreadProcessId.restype = wintypes.DWORD
-user32.AttachThreadInput.argtypes = (wintypes.DWORD, wintypes.DWORD, wintypes.BOOL)
-user32.AttachThreadInput.restype = wintypes.BOOL
-kernel32.GetCurrentThreadId.argtypes = ()
-kernel32.GetCurrentThreadId.restype = wintypes.DWORD
-
-_pressed = set()
 _lock = threading.RLock()
+_serial = None
+_port: Optional[str] = None
+_last_error = "HID not initialized"
+_last_probe = 0.0
+_pressed = set()
 
 
-def _target_hwnd() -> int:
-    capture = getattr(config, "capture", None)
-    if capture is None:
-        return 0
-    hwnd = int(getattr(capture, "_capture_target_hwnd", 0) or 0)
-    return hwnd if hwnd and user32.IsWindow(wintypes.HWND(hwnd)) else 0
+def _candidate_ports():
+    forced = os.environ.get("AUTO_MAPLE_HID_PORT", "").strip()
+    if forced:
+        yield forced
+        return
+    if list_ports is None:
+        return
+    ports = list(list_ports.comports())
+    preferred = []
+    other = []
+    for item in ports:
+        text = f"{item.description} {item.manufacturer or ''} {item.hwid}".casefold()
+        if any(token in text for token in ("arduino", "leonardo", "pro micro", "32u4", "sparkfun")):
+            preferred.append(item.device)
+        else:
+            other.append(item.device)
+    for device in preferred + other:
+        yield device
 
 
-def _thread_id(hwnd: int) -> int:
-    if not hwnd:
-        return 0
-    pid = wintypes.DWORD(0)
-    return int(user32.GetWindowThreadProcessId(wintypes.HWND(hwnd), ctypes.byref(pid)) or 0)
+def _close_locked():
+    global _serial, _port
+    ser = _serial
+    _serial = None
+    _port = None
+    if ser is not None:
+        try:
+            ser.close()
+        except Exception:
+            pass
 
 
-def _focus_exact_target() -> bool:
-    """Make the exact WGC target the input foreground immediately before SendInput."""
-    hwnd = _target_hwnd()
-    if not hwnd:
-        return False
-    target = wintypes.HWND(hwnd)
-    if int(user32.GetForegroundWindow() or 0) == hwnd:
-        return True
-
-    if user32.IsIconic(target):
-        user32.ShowWindow(target, SW_RESTORE)
-
-    current_tid = int(kernel32.GetCurrentThreadId() or 0)
-    foreground = int(user32.GetForegroundWindow() or 0)
-    foreground_tid = _thread_id(foreground)
-    target_tid = _thread_id(hwnd)
-    attached = []
+def _handshake(ser) -> bool:
     try:
-        for tid in (foreground_tid, target_tid):
-            if tid and current_tid and tid != current_tid and tid not in attached:
-                if user32.AttachThreadInput(current_tid, tid, True):
-                    attached.append(tid)
-        user32.BringWindowToTop(target)
-        user32.SetForegroundWindow(target)
-        user32.SetActiveWindow(target)
-        user32.SetFocus(target)
-    finally:
-        for tid in reversed(attached):
-            user32.AttachThreadInput(current_tid, tid, False)
-
-    # Give the old Unity input queue a tiny amount of time to observe focus.
-    deadline = time.monotonic() + 0.08
+        ser.reset_input_buffer()
+        ser.reset_output_buffer()
+    except Exception:
+        pass
+    ser.write(b"PING\n")
+    ser.flush()
+    deadline = time.monotonic() + 1.2
     while time.monotonic() < deadline:
-        if int(user32.GetForegroundWindow() or 0) == hwnd:
+        raw = ser.readline()
+        if not raw:
+            continue
+        text = raw.decode("utf-8", errors="ignore").strip()
+        if text == f"PONG {PROTOCOL}" or text == f"READY {PROTOCOL}":
             return True
-        time.sleep(0.005)
     return False
 
 
-def _send_scan(key: str, key_up_event: bool) -> bool:
-    key = str(key).lower()
-    if key not in SCAN:
-        return False
-    if not _focus_exact_target():
+def initialize(force: bool = False) -> bool:
+    """Connect to the first Auto Maple HID device found on a COM port."""
+    global _serial, _port, _last_error, _last_probe
+    with _lock:
+        if _serial is not None and getattr(_serial, "is_open", False) and not force:
+            return True
+        now = time.monotonic()
+        if not force and now - _last_probe < 1.5:
+            return False
+        _last_probe = now
+        _close_locked()
+
+        if serial is None:
+            _last_error = "pyserial is not installed; run setup_wgc.bat again"
+            return False
+
+        errors = []
+        for port in _candidate_ports() or ():
+            try:
+                ser = serial.Serial(port, BAUDRATE, timeout=0.15, write_timeout=0.25)
+                # Native-USB Arduino boards commonly reset when the serial port opens.
+                time.sleep(1.6)
+                if _handshake(ser):
+                    _serial = ser
+                    _port = port
+                    _last_error = ""
+                    print(f"\n[~] USB HID keyboard connected on {port} ({PROTOCOL})")
+                    return True
+                ser.close()
+                errors.append(f"{port}: handshake failed")
+            except Exception as exc:
+                errors.append(f"{port}: {type(exc).__name__}: {exc}")
+
+        _last_error = "No Auto Maple HID device found"
+        if errors:
+            _last_error += " | " + "; ".join(errors[:4])
         return False
 
-    flags = KEYEVENTF_SCANCODE
-    if key in EXTENDED_KEYS:
-        flags |= KEYEVENTF_EXTENDEDKEY
-    if key_up_event:
-        flags |= KEYEVENTF_KEYUP
 
-    event = INPUT(
-        type=INPUT_KEYBOARD,
-        ki=KEYBDINPUT(wVk=0, wScan=SCAN[key], dwFlags=flags, time=0, dwExtraInfo=0),
-    )
-    return int(user32.SendInput(1, ctypes.byref(event), ctypes.sizeof(INPUT))) == 1
+def is_ready() -> bool:
+    with _lock:
+        if _serial is not None and getattr(_serial, "is_open", False):
+            return True
+    return initialize(force=False)
+
+
+def port_name() -> str:
+    with _lock:
+        return _port or ""
+
+
+def last_error() -> str:
+    with _lock:
+        return _last_error
+
+
+def status_text() -> str:
+    return f"USB HID ready on {port_name()}" if is_ready() else f"USB HID unavailable: {last_error()}"
+
+
+def _send(command: str) -> bool:
+    global _last_error
+    with _lock:
+        if _serial is None or not getattr(_serial, "is_open", False):
+            pass
+        else:
+            try:
+                _serial.write((command.strip() + "\n").encode("ascii"))
+                _serial.flush()
+                return True
+            except Exception as exc:
+                _last_error = f"HID write failed: {type(exc).__name__}: {exc}"
+                _close_locked()
+                return False
+    if not initialize(force=False):
+        return False
+    with _lock:
+        try:
+            _serial.write((command.strip() + "\n").encode("ascii"))
+            _serial.flush()
+            return True
+        except Exception as exc:
+            _last_error = f"HID write failed: {type(exc).__name__}: {exc}"
+            _close_locked()
+            return False
+
+
+def _normalize(key: str) -> str:
+    normalized = str(key).strip().lower()
+    if normalized not in VALID_KEYS:
+        raise ValueError(f"Unsupported HID key: {key!r}")
+    return normalized
 
 
 def key_down(key: str) -> bool:
-    key = str(key).lower()
-    if not config.enabled:
-        return False
-    ok = _send_scan(key, False)
-    if ok:
+    key = _normalize(key)
+    if _send(f"KD {key.upper()}"):
         with _lock:
             _pressed.add(key)
-    return ok
+        return True
+    return False
 
 
 def key_up(key: str) -> bool:
-    key = str(key).lower()
-    ok = _send_scan(key, True)
+    key = _normalize(key)
+    ok = _send(f"KU {key.upper()}")
     with _lock:
         _pressed.discard(key)
     return ok
 
 
 def press(key: str, n: int = 1, down_time: float = 0.05, up_time: float = 0.03) -> bool:
+    key = _normalize(key)
     if n < 1:
         return False
     sent = False
+    hold_ms = max(1, min(2000, int(round(max(0.0, down_time) * 1000))))
     for _ in range(n):
-        if not key_down(key):
+        if not _send(f"PRESS {key.upper()} {hold_ms}"):
             return sent
         sent = True
-        try:
-            time.sleep(max(0.0, down_time))
-        finally:
-            key_up(key)
-        time.sleep(max(0.0, up_time))
+        time.sleep(max(0.0, down_time) + max(0.0, up_time))
     return sent
 
 
 def combo(first: str, second: str, first_lead: float = 0.03, hold: float = 0.08) -> bool:
+    first = _normalize(first)
+    second = _normalize(second)
     if not key_down(first):
         return False
     try:
@@ -214,10 +232,13 @@ def combo(first: str, second: str, first_lead: float = 0.03, hold: float = 0.08)
 
 def release_all() -> None:
     with _lock:
-        keys = tuple(_pressed)
         _pressed.clear()
-    for key in keys:
-        try:
-            _send_scan(key, True)
-        except Exception:
-            pass
+    _send("RELEASE_ALL")
+
+
+def close() -> None:
+    try:
+        release_all()
+    finally:
+        with _lock:
+            _close_locked()
