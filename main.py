@@ -6,6 +6,7 @@ import time
 from src.common import config
 from src.common.logging_config import configure_logging, get_logger
 from src.common.vkeys import release_all
+from src.modules import game_input
 from src.modules.bot import Bot
 from src.modules.capture import Capture
 from src.modules.classic_vision_backend import install_classic_vision_backend
@@ -58,6 +59,10 @@ def main():
     install_patrol_input_patch(PatrolController)
     install_manual_foreground_input(Listener, PatrolController)
 
+    # HID is optional at startup so vision/debug tools remain usable without the
+    # board. Insert will refuse to enable patrol until the bridge is connected.
+    hid_ready = game_input.initialize(force=False)
+
     bot = Bot()
     capture = Capture()
     scene_observer = SceneObserver()
@@ -82,8 +87,13 @@ def main():
     print("[~] Idle mode: main-scene YOLO sleeps until automation or F10 is enabled")
     print("[~] F10 preview: combined Monster / Ladder / Platform cache (5Hz)")
     print("[~] Patrol: Insert starts/stops; Shift attack; Space jump; Down+Space drop; rapid Z loot")
-    print("[~] Input: manual-foreground scan-code SendInput; Auto Maple never forces MapleStory to the front")
-    print("[~] Safety: patrol input pauses immediately when MapleStory is not the active window")
+    print("[~] Input: USB HID keyboard bridge; Auto Maple never forces MapleStory to the front")
+    print("[~] Safety: HID patrol input is emitted only while MapleStory is the active window")
+    if hid_ready:
+        print(f"[~] HID status: ready on {game_input.port_name()}")
+    else:
+        print(f"[!] HID status: {game_input.last_error()}")
+        print("[~] Vision/debug remains available. Connect the HID board before pressing Insert.")
     print("[~] Press F8 to start dataset recording")
     print("[~] Press F9 to stop dataset recording")
     print("[~] Press F10 to toggle combined vision debug")
@@ -132,6 +142,10 @@ if __name__ == "__main__":
                 capture.stop()
             except Exception:
                 logger.exception("Capture shutdown failed")
+        try:
+            game_input.close()
+        except Exception:
+            logger.exception("USB HID shutdown failed")
         release_all()
         logger.info("Auto Maple shutdown complete with exit code %s", exit_code)
 
