@@ -24,7 +24,7 @@ class PatrolController:
     LOOP_HZ = 30
     LOOP_INTERVAL = 1.0 / LOOP_HZ
 
-    ATTACK_KEY = "shift"
+    ATTACK_KEY = "a"
     JUMP_KEY = "space"
     LOOT_KEY = "z"
 
@@ -68,7 +68,7 @@ class PatrolController:
 
     def start(self):
         print("\n[~] Started patrol/combat controller")
-        print("[~] Attack=Shift | Jump=Space | Drop=Down+Space | Loot=rapid Z")
+        print("[~] Attack=A | Jump=Space | Drop=Down+Space | Loot=rapid Z")
         print("[~] Patrol input is blocked unless MapleStory is the foreground window")
         self.thread.start()
 
