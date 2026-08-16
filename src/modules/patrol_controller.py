@@ -1,7 +1,7 @@
 """Simple full-map patrol/combat state machine for the classic client.
 
 Safety rule: this controller never sends a key unless the captured MapleStory
-window is currently the foreground window.  It also uses short key pulses rather
+window is currently the foreground window. It also uses short key pulses rather
 than long holds so focus changes cannot leave movement keys stuck.
 """
 
@@ -32,15 +32,20 @@ class PatrolController:
     LOOT_INTERVAL = 0.12
     WALK_PULSE = 0.075
     WALK_GAP = 0.015
-    FACE_PULSE = 0.035
 
-    MONSTER_CLEAR_GRACE = 0.42
-    COMBAT_REACQUIRE_GRACE = 0.90
+    # Only attack monsters that are close, on roughly the same floor, and in
+    # the current patrol direction. This prevents wasting arrows on monsters
+    # behind the character or on another platform.
+    ATTACK_DISTANCE = 210.0
+    MONSTER_VERTICAL_TOLERANCE = 90
+    FORWARD_DEADZONE = 10
+
     KNOCKBACK_PIXEL_JUMP = 90.0
-    FAR_MONSTER_DISTANCE = 260.0
 
-    EDGE_LEFT = 0.10
-    EDGE_RIGHT = 0.90
+    # Turn a little before the absolute minimap edge so there is time to align
+    # with a ladder / perform the floor transition before hitting the wall.
+    EDGE_LEFT = 0.12
+    EDGE_RIGHT = 0.88
     MAP_TOP = 0.18
     MAP_BOTTOM = 0.82
     LEVEL_CHANGE_THRESHOLD = 0.025
@@ -59,8 +64,6 @@ class PatrolController:
         self._vertical_preference = "up"
         self._last_attack = 0.0
         self._last_loot = 0.0
-        self._last_monster_seen = 0.0
-        self._combat_lock_until = 0.0
         self._previous_monster_distance: Optional[float] = None
         self._last_vertical_action = 0.0
         self._last_focus_warning = 0.0
@@ -68,7 +71,8 @@ class PatrolController:
 
     def start(self):
         print("\n[~] Started patrol/combat controller")
-        print("[~] Attack=A | Jump=Space | Drop=Down+Space | Loot=rapid Z")
+        print("[~] Attack=A | Jump=Space | Drop=Space+Down | Climb=Space+Up | Loot=rapid Z")
+        print("[~] Combat only targets nearby monsters in the current patrol direction")
         print("[~] Patrol input is blocked unless MapleStory is the foreground window")
         self.thread.start()
 
@@ -142,55 +146,54 @@ class PatrolController:
     def _distance(a: Point, b: Point) -> float:
         return math.hypot(a[0] - b[0], a[1] - b[1])
 
-    def _nearest_monster(self, snapshot, anchor: Point):
+    def _forward_monster(self, snapshot, anchor: Point):
+        """Return the nearest attackable monster in the current patrol direction."""
         monsters = tuple(getattr(snapshot, "monsters", ()) or ())
         if not monsters:
             return None, None
-        target = min(monsters, key=lambda item: self._distance(anchor, item.center))
-        return target, self._distance(anchor, target.center)
 
-    def _face_target(self, anchor: Point, monster) -> None:
-        if monster is None:
-            return
-        direction = "right" if monster.center[0] >= anchor[0] else "left"
-        self._safe_press(direction, down_time=self.FACE_PULSE, up_time=0.005)
+        candidates = []
+        for monster in monsters:
+            dx = monster.center[0] - anchor[0]
+            dy = abs(monster.center[1] - anchor[1])
+
+            if dy > self.MONSTER_VERTICAL_TOLERANCE:
+                continue
+            if self._patrol_direction == "right" and dx < self.FORWARD_DEADZONE:
+                continue
+            if self._patrol_direction == "left" and dx > -self.FORWARD_DEADZONE:
+                continue
+
+            distance = self._distance(anchor, monster.center)
+            if distance <= self.ATTACK_DISTANCE:
+                candidates.append((distance, monster))
+
+        if not candidates:
+            return None, None
+
+        distance, target = min(candidates, key=lambda item: item[0])
+        return target, distance
 
     def _combat(self, snapshot, anchor: Point, now: float) -> bool:
-        monster, distance = self._nearest_monster(snapshot, anchor)
-        if monster is not None:
-            self._last_monster_seen = now
-            self._combat_lock_until = max(self._combat_lock_until, now + self.MONSTER_CLEAR_GRACE)
+        monster, distance = self._forward_monster(snapshot, anchor)
+        if monster is None:
+            self._previous_monster_distance = None
+            return False
 
-            if self._previous_monster_distance is not None and distance is not None:
-                jumped = distance - self._previous_monster_distance
-                if jumped >= self.KNOCKBACK_PIXEL_JUMP:
-                    self._combat_lock_until = max(
-                        self._combat_lock_until, now + self.COMBAT_REACQUIRE_GRACE
-                    )
-                    self._state = "combat-knockback-recovery"
+        if self._previous_monster_distance is not None and distance is not None:
+            jumped = distance - self._previous_monster_distance
+            if jumped >= self.KNOCKBACK_PIXEL_JUMP:
+                self._state = "combat-knockback-recovery"
+        self._previous_monster_distance = distance
 
-            self._previous_monster_distance = distance
-            self._face_target(anchor, monster)
+        # Keep facing the patrol direction. We intentionally do not turn around
+        # for monsters behind us; they will be handled on the return sweep.
+        if now - self._last_attack >= self.ATTACK_INTERVAL:
+            self._safe_press(self.ATTACK_KEY, down_time=0.055, up_time=0.025)
+            self._last_attack = now
 
-            if distance is not None and distance > self.FAR_MONSTER_DISTANCE:
-                direction = "right" if monster.center[0] >= anchor[0] else "left"
-                self._safe_press(direction, down_time=0.055, up_time=0.005)
-
-            if now - self._last_attack >= self.ATTACK_INTERVAL:
-                self._safe_press(self.ATTACK_KEY, down_time=0.055, up_time=0.025)
-                self._last_attack = now
-            self._state = "combat"
-            return True
-
-        if now < self._combat_lock_until:
-            if now - self._last_attack >= self.ATTACK_INTERVAL:
-                self._safe_press(self.ATTACK_KEY, down_time=0.055, up_time=0.025)
-                self._last_attack = now
-            self._state = "combat-reacquire"
-            return True
-
-        self._previous_monster_distance = None
-        return False
+        self._state = f"combat-{self._patrol_direction}"
+        return True
 
     def _rapid_loot(self, now: float) -> None:
         if now - self._last_loot < self.LOOT_INTERVAL:
@@ -230,6 +233,9 @@ class PatrolController:
 
         before = self._minimap_player()
         self._state = "climb-ladder"
+
+        # User-defined classic-client sequence: jump first, then Up to catch
+        # the ladder, followed by short Up pulses to continue climbing.
         if not self._safe_combo(self.JUMP_KEY, "up", first_lead=0.025, hold=0.11):
             return False
         for _ in range(5):
@@ -237,6 +243,7 @@ class PatrolController:
                 break
             self._safe_press("up", down_time=0.10, up_time=0.025)
         time.sleep(0.10)
+
         after = self._minimap_player()
         if before is not None and after is not None:
             return before[1] - after[1] >= self.LEVEL_CHANGE_THRESHOLD
@@ -245,13 +252,19 @@ class PatrolController:
     def _drop_down(self) -> bool:
         before = self._minimap_player()
         self._state = "drop-down"
-        if not self._safe_combo("down", self.JUMP_KEY, first_lead=0.03, hold=0.08):
+
+        # User-defined sequence: Space first, then Down.
+        if not self._safe_combo(self.JUMP_KEY, "down", first_lead=0.03, hold=0.08):
             return False
         time.sleep(0.22)
+
         after = self._minimap_player()
         if before is not None and after is not None:
             return after[1] - before[1] >= self.LEVEL_CHANGE_THRESHOLD
         return True
+
+    def _reverse_patrol_direction(self) -> None:
+        self._patrol_direction = "left" if self._patrol_direction == "right" else "right"
 
     def _edge_transition(self, snapshot, anchor: Point, now: float, pos) -> bool:
         if now - self._last_vertical_action < self.VERTICAL_COOLDOWN:
@@ -267,25 +280,56 @@ class PatrolController:
         elif y >= self.MAP_BOTTOM:
             self._vertical_preference = "up"
 
-        changed = False
         ladder = self._nearest_ladder(snapshot, anchor)
 
         if self._vertical_preference == "up" and ladder is not None:
-            changed = self._climb_ladder(ladder, anchor)
-        elif self._vertical_preference == "down" and self._platform_below(snapshot, anchor):
-            changed = self._drop_down()
-        elif ladder is not None:
-            changed = self._climb_ladder(ladder, anchor)
-        elif self._platform_below(snapshot, anchor):
-            changed = self._drop_down()
+            # If not yet centered on the ladder, align first and keep the same
+            # sweep direction; do not prematurely turn around.
+            if abs(ladder.center[0] - anchor[0]) > self.LADDER_ALIGN_PIXELS:
+                self._climb_ladder(ladder, anchor)
+                self._last_vertical_action = now
+                return True
 
-        self._last_vertical_action = now
-        if changed:
-            self._patrol_direction = "left" if self._patrol_direction == "right" else "right"
-            self._state = "level-changed"
+            changed = self._climb_ladder(ladder, anchor)
+            self._last_vertical_action = now
+            if changed:
+                self._reverse_patrol_direction()
+                self._state = "level-up-turnaround"
             return True
 
-        self._patrol_direction = "left" if self._patrol_direction == "right" else "right"
+        if self._vertical_preference == "down" and self._platform_below(snapshot, anchor):
+            changed = self._drop_down()
+            self._last_vertical_action = now
+            if changed:
+                self._reverse_patrol_direction()
+                self._state = "level-down-turnaround"
+            return True
+
+        # Fallback when the preferred transition is unavailable.
+        if ladder is not None:
+            if abs(ladder.center[0] - anchor[0]) > self.LADDER_ALIGN_PIXELS:
+                self._climb_ladder(ladder, anchor)
+                self._last_vertical_action = now
+                return True
+            changed = self._climb_ladder(ladder, anchor)
+            self._last_vertical_action = now
+            if changed:
+                self._reverse_patrol_direction()
+                self._state = "level-up-turnaround"
+            return True
+
+        if self._platform_below(snapshot, anchor):
+            changed = self._drop_down()
+            self._last_vertical_action = now
+            if changed:
+                self._reverse_patrol_direction()
+                self._state = "level-down-turnaround"
+            return True
+
+        # No usable vertical transition at this edge: simply reverse and sweep
+        # the same floor back in the opposite direction.
+        self._last_vertical_action = now
+        self._reverse_patrol_direction()
         self._state = "edge-turnaround"
         return True
 
@@ -338,6 +382,9 @@ class PatrolController:
 
                 now = time.monotonic()
                 self._rapid_loot(now)
+
+                # Combat gets priority only for a nearby monster in the active
+                # sweep direction. Otherwise continue the left/right patrol.
                 if not self._combat(snapshot, anchor, now):
                     self._patrol(snapshot, anchor, now)
 
