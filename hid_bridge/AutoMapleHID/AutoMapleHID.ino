@@ -13,6 +13,7 @@ uint8_t keyCode(const String& name) {
   if (name == "SHIFT") return KEY_LEFT_SHIFT;
   if (name == "SPACE") return ' ';
   if (name == "Z") return 'z';
+  if (name == "A") return 'a';
   return 0;
 }
 
