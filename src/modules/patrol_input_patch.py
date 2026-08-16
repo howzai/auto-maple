@@ -31,15 +31,26 @@ def install_patrol_input_patch(patrol_class) -> None:
             return False
         return game_input.press(key, 1, down_time=down_time, up_time=up_time)
 
+    def safe_key_down(self, key: str) -> bool:
+        if not config.enabled or not _game_target_ready() or not game_input.is_ready():
+            return False
+        return game_input.key_down(key)
+
+    def safe_key_up(self, key: str) -> bool:
+        if not game_input.is_ready():
+            return False
+        return game_input.key_up(key)
+
     def safe_combo(self, first: str, second: str, first_lead: float = 0.025, hold: float = 0.08) -> bool:
         if not config.enabled or not _game_target_ready() or not game_input.is_ready():
             return False
         return game_input.combo(first, second, first_lead=first_lead, hold=hold)
 
     patrol_class._safe_press = safe_press
+    patrol_class._safe_key_down = safe_key_down
+    patrol_class._safe_key_up = safe_key_up
     patrol_class._safe_combo = safe_combo
 
-    # Stable bow cadence; actual key report is emitted by the HID device.
     patrol_class.ATTACK_INTERVAL = 0.24
     patrol_class.ATTACK_KEY_DOWN_TIME = 0.12
 
