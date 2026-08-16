@@ -59,8 +59,6 @@ def main():
     install_patrol_input_patch(PatrolController)
     install_manual_foreground_input(Listener, PatrolController)
 
-    # HID is optional at startup so vision/debug tools remain usable without the
-    # board. Insert will refuse to enable patrol until the bridge is connected.
     hid_ready = game_input.initialize(force=False)
 
     bot = Bot()
@@ -86,7 +84,7 @@ def main():
     print("[~] Main-scene vision: Monster 10Hz + Ladder/Platform 1Hz @ 480px")
     print("[~] Idle mode: main-scene YOLO sleeps until automation or F10 is enabled")
     print("[~] F10 preview: combined Monster / Ladder / Platform cache (5Hz)")
-    print("[~] Patrol: Insert starts/stops; Shift attack; Space jump; Down+Space drop; rapid Z loot")
+    print("[~] Patrol: Insert starts/stops; A attack; Space jump; Down+Space drop; rapid Z loot")
     print("[~] Input: USB HID keyboard bridge; Auto Maple never forces MapleStory to the front")
     print("[~] Safety: HID patrol input is emitted only while MapleStory is the active window")
     if hid_ready:
