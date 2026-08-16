@@ -1,9 +1,9 @@
 """Full-map patrol/combat state machine for the classic client.
 
-Patrol movement is continuous, loot is held, combat only engages nearby monsters
-in the current sweep direction, wall/edge handling searches for the nearest
-ladder, and sudden minimap displacement is treated as knockback so combat can
-recover instead of stalling.
+Patrol movement is continuous, loot is held, normal combat only engages monsters
+that are already inside the nearby attack zone in the current sweep direction.
+Patrol never chases a distant detection. Chasing is reserved for short knockback
+recovery after combat has already been established.
 """
 
 from __future__ import annotations
@@ -31,13 +31,13 @@ class PatrolController:
 
     ATTACK_INTERVAL = 0.16
     ATTACK_DISTANCE = 210.0
-    CHASE_DISTANCE = 340.0
     MONSTER_VERTICAL_TOLERANCE = 90
     FORWARD_DEADZONE = 10
 
     KNOCKBACK_PIXEL_JUMP = 90.0
     MINIMAP_KNOCKBACK_X = 0.055
     KNOCKBACK_RECOVERY_SECONDS = 0.90
+    COMBAT_MEMORY_SECONDS = 0.80
 
     EDGE_LEFT = 0.12
     EDGE_RIGHT = 0.88
@@ -69,11 +69,13 @@ class PatrolController:
         self._last_minimap_pos: Optional[Tuple[float, float]] = None
         self._last_target_direction: Optional[str] = None
         self._knockback_recover_until = 0.0
+        self._combat_engaged_until = 0.0
 
     def start(self):
         print("\n[~] Started patrol/combat controller")
         print("[~] Attack=A | Jump=Space | Drop=Space+Down | Climb=Space+Up | Loot=hold Z")
-        print("[~] Nearby forward monsters only; knockback uses minimap recovery")
+        print("[~] Normal patrol never chases distant detections; only nearby forward monsters are attacked")
+        print("[~] Short chase is allowed only after confirmed-combat knockback")
         self.thread.start()
 
     def stop(self):
@@ -189,6 +191,12 @@ class PatrolController:
         self._last_minimap_pos = pos
         if pos is None or previous is None:
             return False
+
+        # A large minimap jump only counts as knockback if combat was already
+        # established. Normal patrol movement must never create a chase state.
+        if now > self._combat_engaged_until:
+            return False
+
         if abs(pos[0] - previous[0]) >= self.MINIMAP_KNOCKBACK_X:
             self._knockback_recover_until = max(
                 self._knockback_recover_until,
@@ -208,7 +216,8 @@ class PatrolController:
         target = min(monsters, key=lambda item: self._distance(anchor, item.center))
         return target, self._distance(anchor, target.center)
 
-    def _forward_monster(self, snapshot, anchor: Point):
+    def _nearby_forward_monster(self, snapshot, anchor: Point):
+        """Return only a monster already inside the immediate attack zone."""
         candidates = []
         for monster in self._all_monsters(snapshot):
             dx = monster.center[0] - anchor[0]
@@ -220,7 +229,7 @@ class PatrolController:
             if self._patrol_direction == "left" and dx > -self.FORWARD_DEADZONE:
                 continue
             distance = self._distance(anchor, monster.center)
-            if distance <= self.CHASE_DISTANCE:
+            if distance <= self.ATTACK_DISTANCE:
                 candidates.append((distance, monster))
         if not candidates:
             return None, None
@@ -246,6 +255,10 @@ class PatrolController:
             else:
                 self._release_motion()
                 self._attack_if_ready(now)
+                self._combat_engaged_until = max(
+                    self._combat_engaged_until,
+                    now + self.COMBAT_MEMORY_SECONDS,
+                )
                 self._state = "combat-knockback-attack"
             return True
 
@@ -259,13 +272,17 @@ class PatrolController:
         if self._recover_from_knockback(snapshot, anchor, now):
             return True
 
-        monster, distance = self._forward_monster(snapshot, anchor)
+        monster, distance = self._nearby_forward_monster(snapshot, anchor)
         if monster is None:
             self._previous_monster_distance = None
             return False
 
         direction = "right" if monster.center[0] >= anchor[0] else "left"
         self._last_target_direction = direction
+        self._combat_engaged_until = max(
+            self._combat_engaged_until,
+            now + self.COMBAT_MEMORY_SECONDS,
+        )
 
         if self._previous_monster_distance is not None and distance is not None:
             if distance - self._previous_monster_distance >= self.KNOCKBACK_PIXEL_JUMP:
@@ -275,11 +292,8 @@ class PatrolController:
                 )
         self._previous_monster_distance = distance
 
-        if distance is not None and distance > self.ATTACK_DISTANCE:
-            self._set_motion(direction)
-            self._state = "chase-forward-monster"
-            return True
-
+        # The target is already inside attack range. Stop walking and attack.
+        # There is deliberately no normal chase behavior here.
         self._release_motion()
         self._attack_if_ready(now)
         self._state = f"combat-{self._patrol_direction}"
@@ -427,6 +441,8 @@ class PatrolController:
                     self._state = "idle"
                     self._previous_monster_distance = None
                     self._last_minimap_pos = None
+                    self._combat_engaged_until = 0.0
+                    self._knockback_recover_until = 0.0
                     time.sleep(0.03)
                     continue
 
