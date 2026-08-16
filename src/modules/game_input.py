@@ -1,8 +1,8 @@
 """USB HID keyboard backend for Auto Maple.
 
 The Windows synthetic-input experiments (PostMessage/keybd_event/SendInput) are
-not used here.  Patrol commands are sent over a serial link to a small USB HID
-microcontroller (for example an ATmega32U4 Pro Micro/Leonardo).  The device then
+not used here. Patrol commands are sent over a serial link to a small USB HID
+microcontroller (for example an ATmega32U4 Pro Micro/Leonardo). The device then
 emits normal USB keyboard reports.
 
 Safety remains in PatrolController/manual_foreground_input: commands are only
@@ -19,14 +19,14 @@ from typing import Optional
 try:
     import serial
     from serial.tools import list_ports
-except Exception:  # setup may not have installed pyserial yet
+except Exception:
     serial = None
     list_ports = None
 
 
 BAUDRATE = 115200
 PROTOCOL = "AUTO_MAPLE_HID_V1"
-VALID_KEYS = {"left", "right", "up", "down", "shift", "space", "z"}
+VALID_KEYS = {"left", "right", "up", "down", "shift", "space", "z", "a"}
 
 _lock = threading.RLock()
 _serial = None
@@ -88,7 +88,6 @@ def _handshake(ser) -> bool:
 
 
 def initialize(force: bool = False) -> bool:
-    """Connect to the first Auto Maple HID device found on a COM port."""
     global _serial, _port, _last_error, _last_probe
     with _lock:
         if _serial is not None and getattr(_serial, "is_open", False) and not force:
@@ -107,7 +106,6 @@ def initialize(force: bool = False) -> bool:
         for port in _candidate_ports() or ():
             try:
                 ser = serial.Serial(port, BAUDRATE, timeout=0.15, write_timeout=0.25)
-                # Native-USB Arduino boards commonly reset when the serial port opens.
                 time.sleep(1.6)
                 if _handshake(ser):
                     _serial = ser
@@ -150,9 +148,7 @@ def status_text() -> str:
 def _send(command: str) -> bool:
     global _last_error
     with _lock:
-        if _serial is None or not getattr(_serial, "is_open", False):
-            pass
-        else:
+        if _serial is not None and getattr(_serial, "is_open", False):
             try:
                 _serial.write((command.strip() + "\n").encode("ascii"))
                 _serial.flush()
